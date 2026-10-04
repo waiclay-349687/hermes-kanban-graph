@@ -1,0 +1,7 @@
+manifest_version: 1
+name: kanban-graph
+version: "0.1.0"
+description: Kanban task graph; editable content, read-only links
+kind: standalone
+provides_tools: []
+provides_hooks: []

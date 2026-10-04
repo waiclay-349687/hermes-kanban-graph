@@ -1,0 +1,13 @@
+{
+  "name": "kanban-graph",
+  "label": "Kanban Graph",
+  "description": "Interactive task graph with editable Kanban content and read-only dependency links",
+  "icon": "Package",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/kanban-graph",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
