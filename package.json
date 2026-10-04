@@ -1,13 +1,14 @@
 {
   "name": "hermes-kanban-graph",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "verify": "npm audit --audit-level=low && npm test && npm run typecheck && npm run build"
+    "audit": "npm audit --audit-level=low",
+    "verify": "npm test && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@dagrejs/dagre": "3.0.0",

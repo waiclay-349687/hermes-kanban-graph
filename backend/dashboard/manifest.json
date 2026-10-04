@@ -1,9 +1,9 @@
 {
   "name": "kanban-graph",
   "label": "Kanban Graph",
-  "description": "Interactive task graph with editable Kanban content and read-only dependency links",
+  "description": "Interactive dependency graph for Hermes Kanban boards; edits go through the bundled Kanban backend, links stay read-only",
   "icon": "Package",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tab": {
     "path": "/kanban-graph",
     "hidden": true
