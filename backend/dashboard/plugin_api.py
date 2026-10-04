@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import logging
 import os
 import sqlite3
-import time
+import sys
+import threading
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal, Optional
+from types import ModuleType
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from hermes_cli import kanban_db
 from pydantic import BaseModel, ConfigDict, Field
 
 
-def _load_serializer():
+def _load_graph_data():
     try:
-        from .graph_data import serialize_graph
-        return serialize_graph
+        from . import graph_data
+        return graph_data
     except (ImportError, ValueError):
         path = Path(__file__).with_name("graph_data.py")
         spec = importlib.util.spec_from_file_location("hermes_kanban_graph_data", path)
@@ -26,12 +27,18 @@ def _load_serializer():
             raise RuntimeError("could not load graph_data.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.serialize_graph
+        return module
 
 
-serialize_graph = _load_serializer()
+_graph_data = _load_graph_data()
+serialize_graph = _graph_data.serialize_graph
+empty_graph = _graph_data.empty_graph
 router = APIRouter()
 log = logging.getLogger(__name__)
+
+# Fields of a task row that describe worker/process internals. They are never
+# useful to the graph UI and must not leave the backend.
+_PRIVATE_TASK_FIELDS = frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at"})
 
 
 def _resolve_board(board: Optional[str]) -> str:
@@ -50,6 +57,21 @@ def _resolve_board(board: Optional[str]) -> str:
     return normalized
 
 
+# --- strict read-only SQLite -------------------------------------------------
+
+_READ_ACTIONS = frozenset(
+    getattr(sqlite3, name)
+    for name in ("SQLITE_SELECT", "SQLITE_READ", "SQLITE_FUNCTION", "SQLITE_RECURSIVE")
+    if hasattr(sqlite3, name)
+)
+
+
+def _read_only_authorizer(action, _arg1, _arg2, _db_name, _trigger):
+    """Defense in depth on top of ``mode=ro`` + ``query_only``: deny every
+    statement that is not a plain read (DDL, DML, ATTACH, PRAGMA, ...)."""
+    return sqlite3.SQLITE_OK if action in _READ_ACTIONS else sqlite3.SQLITE_DENY
+
+
 def _connection(path: Path):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
@@ -59,6 +81,9 @@ def _connection(path: Path):
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=2000")
         conn.execute("PRAGMA trusted_schema=OFF")
+        set_authorizer = getattr(conn, "set_authorizer", None)
+        if set_authorizer is not None:
+            set_authorizer(_read_only_authorizer)
     except Exception:
         conn.close()
         raise
@@ -66,6 +91,7 @@ def _connection(path: Path):
 
 
 def _write_connection(path: Path):
+    """Raw read-write connection used only for comments (``kanban_db.add_comment``)."""
     if not path.exists():
         raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
     conn = sqlite3.connect(
@@ -85,13 +111,80 @@ def _write_connection(path: Path):
     return conn
 
 
+def _public_task(task) -> dict[str, Any]:
+    item = asdict(task)
+    for key in _PRIVATE_TASK_FIELDS:
+        item.pop(key, None)
+    return item
+
+
 def _task_payload(conn, task_id: str):
     task = kanban_db.get_task(conn, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-    item = asdict(task)
+    item = _public_task(task)
     item["latest_summary"] = kanban_db.latest_summaries(conn, [task_id]).get(task_id)
     return item
+
+
+# --- writes delegate to the bundled Kanban dashboard backend ------------------
+#
+# Status and content edits must behave exactly like a drag/edit on the official
+# board (worker termination when leaving ``running``, ``force`` completion,
+# done/archived parent gating, descendant invalidation, lifecycle hooks). Rather
+# than keeping a drifting copy of that logic, reuse the core handlers. When they
+# cannot be found the edit is refused (503) instead of running divergent code.
+
+_CORE_REQUIRED = ("_board_conn", "_require_task", "_patch_status", "_patch_title_body", "UpdateTaskBody")
+_core_lock = threading.Lock()
+_core_module: Optional[ModuleType] = None
+
+
+def _core_dashboard_path() -> Path:
+    return Path(kanban_db.__file__).resolve().parents[1] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+
+
+def _core_dashboard() -> ModuleType:
+    global _core_module
+    if _core_module is not None:
+        return _core_module
+    with _core_lock:
+        if _core_module is not None:
+            return _core_module
+        path = _core_dashboard_path()
+        module: Optional[ModuleType] = None
+        for candidate in list(sys.modules.values()):
+            file = getattr(candidate, "__file__", None)
+            if file and all(hasattr(candidate, name) for name in _CORE_REQUIRED):
+                try:
+                    if Path(file).resolve() == path:
+                        module = candidate
+                        break
+                except OSError:
+                    continue
+        if module is None:
+            if not path.is_file():
+                raise HTTPException(status_code=503, detail="Editing needs the bundled Kanban backend, which was not found")
+            spec = importlib.util.spec_from_file_location("hermes_kanban_graph_core_kanban_api", path)
+            if spec is None or spec.loader is None:
+                raise HTTPException(status_code=503, detail="Could not load the bundled Kanban backend")
+            module = importlib.util.module_from_spec(spec)
+            # Pydantic resolves postponed annotations through sys.modules.
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception as exc:  # pragma: no cover - depends on host install
+                sys.modules.pop(spec.name, None)
+                log.warning("kanban-graph: loading core kanban backend failed: %s", exc)
+                raise HTTPException(status_code=503, detail="Could not load the bundled Kanban backend") from exc
+        missing = [name for name in _CORE_REQUIRED if not hasattr(module, name)]
+        if missing:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Editing is unavailable: the Kanban backend changed ({', '.join(missing)} missing)",
+            )
+        _core_module = module
+        return module
 
 
 class _StrictWritePayload(BaseModel):
@@ -102,121 +195,42 @@ class TaskContentPatch(_StrictWritePayload):
     title: Optional[str] = Field(default=None, max_length=10_000)
     body: Optional[str] = Field(default=None, max_length=200_000)
     status: Optional[Literal["triage", "todo", "ready", "blocked", "done", "archived"]] = None
+    # Completion evidence: Kanban refuses ``done`` without a result/summary.
+    summary: Optional[str] = Field(default=None, max_length=20_000)
 
 
 class CommentCreate(_StrictWritePayload):
     body: str = Field(max_length=200_000)
 
 
-def _unfinished_parents(conn, task_id: str):
-    return conn.execute(
-        "SELECT t.title FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done' "
-        "ORDER BY t.title",
-        (task_id,),
-    ).fetchall()
-
-
-def _set_status_direct(conn, task_id: str, new_status: str) -> bool:
-    """Mirror the official Kanban dashboard's direct status transition.
-
-    Structured transitions such as complete, block, unblock, and archive use
-    their public kanban_db helpers. This handles the remaining operator-owned
-    lanes while preserving active-run and dependency invariants.
-    """
-    with kanban_db.write_txn(conn):
-        previous = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if previous is None:
-            return False
-        if new_status == "ready" and _unfinished_parents(conn, task_id):
-            return False
-
-        was_running = previous["status"] == "running"
-        reopened_parent = (
-            previous["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
-        )
-        updated = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
-        )
-        if updated.rowcount != 1:
-            return False
-
-        run_id = None
-        if was_running and new_status != "running" and previous["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn,
-                task_id,
-                outcome="reclaimed",
-                status="reclaimed",
-                summary=f"status changed to {new_status} (kanban-graph/direct)",
-            )
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
-        )
-
-        if reopened_parent:
-            for row in conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
-                (task_id,),
-            ).fetchall():
-                child_id = row["child_id"]
-                demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
-                if demoted.rowcount == 1:
-                    conn.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                        "VALUES (?, 'status', ?, ?)",
-                        (
-                            child_id,
-                            json.dumps({
-                                "status": "todo",
-                                "reason": "parent_reopened",
-                                "parent": task_id,
-                            }),
-                            int(time.time()),
-                        ),
-                    )
-    if new_status in {"done", "ready"}:
-        kanban_db.recompute_ready(conn)
-    return True
-
-
-def _change_status(conn, task_id: str, new_status: str) -> bool:
-    current = kanban_db.get_task(conn, task_id)
-    if current is None:
-        return False
-    if new_status == "done":
-        return kanban_db.complete_task(conn, task_id)
-    if new_status == "blocked":
-        return kanban_db.block_task(conn, task_id)
-    if new_status == "ready" and current.status in {"blocked", "scheduled"}:
-        return kanban_db.unblock_task(conn, task_id)
-    if new_status == "archived":
-        return kanban_db.archive_task(conn, task_id)
-    return _set_status_direct(conn, task_id, new_status)
-
+# --- read routes --------------------------------------------------------------
 
 @router.get("/health")
 def health():
     return {"ok": True, "plugin": "kanban-graph"}
 
 
+def _board_counts(slug: str) -> Optional[dict[str, Any]]:
+    """Per-status task counts for the board switcher; ``None`` when unreadable."""
+    try:
+        path = kanban_db.kanban_db_path(slug)
+        if not path.exists():
+            return {"initialized": False, "total": 0, "by_status": {}}
+        conn = _connection(path)
+        try:
+            rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:  # unreadable/legacy DB must not break the switcher
+        log.debug("kanban-graph: counting board %s failed: %s", slug, exc)
+        return None
+    by_status = {str(row["status"]): int(row["n"]) for row in rows}
+    total = sum(n for status, n in by_status.items() if status != "archived")
+    return {"initialized": True, "total": total, "by_status": by_status}
+
+
 @router.get("/boards")
-def boards():
+def boards(counts: bool = Query(True)):
     current = kanban_db.get_current_board()
     pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     items = []
@@ -224,12 +238,20 @@ def boards():
         slug = raw.get("slug")
         if pinned and slug != current:
             continue
-        items.append({
+        archived = bool(raw.get("archived"))
+        item: dict[str, Any] = {
             "slug": slug,
             "name": raw.get("name"),
-            "archived": bool(raw.get("archived")),
+            "icon": raw.get("icon") or None,
+            "color": raw.get("color") or None,
+            "archived": archived,
             "is_current": slug == current,
-        })
+        }
+        if counts and not archived:
+            stats = _board_counts(str(slug))
+            if stats is not None:
+                item.update(stats)
+        items.append(item)
     return {"current": current, "boards": items}
 
 
@@ -240,6 +262,8 @@ def graph(
 ):
     slug = _resolve_board(board)
     path = kanban_db.kanban_db_path(slug)
+    if not path.exists():
+        return empty_graph(slug)
     conn = _connection(path)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=include_archived)
@@ -250,6 +274,12 @@ def graph(
             item["latest_summary"] = summaries.get(task.id)
             serialized_tasks.append(item)
 
+        known_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()]
+        archived_count = 0
+        if not include_archived:
+            archived_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE status = 'archived'"
+            ).fetchone()["n"]
         edge_rows = conn.execute(
             "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
         ).fetchall()
@@ -261,6 +291,8 @@ def graph(
             edge_rows,
             board_slug=slug,
             latest_event_id=int(latest_event_id),
+            known_ids=known_ids,
+            archived_count=int(archived_count),
         )
     finally:
         conn.close()
@@ -299,6 +331,8 @@ def task_detail(task_id: str, board: Optional[str] = Query(None)):
         conn.close()
 
 
+# --- write routes -------------------------------------------------------------
+
 @router.patch("/tasks/{task_id}")
 def update_task_content(
     task_id: str,
@@ -309,44 +343,28 @@ def update_task_content(
         raise HTTPException(status_code=400, detail="title, body, or status is required")
     if payload.status is not None and (payload.title is not None or payload.body is not None):
         raise HTTPException(status_code=400, detail="change status separately from title or body")
+    if payload.summary is not None and payload.status != "done":
+        raise HTTPException(status_code=400, detail="summary is only accepted when completing a task")
+    summary = payload.summary.strip() if payload.summary is not None else None
     title = payload.title.strip() if payload.title is not None else None
     if payload.title is not None and not title:
         raise HTTPException(status_code=400, detail="title cannot be empty")
 
     slug = _resolve_board(board)
-    path = kanban_db.kanban_db_path(slug)
-    conn = _write_connection(path)
-    try:
-        task = _task_payload(conn, task_id)
+    if not kanban_db.kanban_db_path(slug).exists():
+        raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
+    core = _core_dashboard()
+    with core._board_conn(slug) as (resolved, conn):
+        core._require_task(conn, task_id)
         if payload.status is not None:
-            if not _change_status(conn, task_id, payload.status):
-                if payload.status == "ready":
-                    parents = _unfinished_parents(conn, task_id)
-                    if parents:
-                        names = ", ".join(row["title"] for row in parents)
-                        raise HTTPException(
-                            status_code=409,
-                            detail=f"Parent tasks must be completed first: {names}",
-                        )
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Cannot move a {task['status']} task to {payload.status}",
-                )
+            change = core.UpdateTaskBody(status=payload.status, summary=summary or None)
+            try:
+                core._patch_status(conn, task_id, change, False)
+            except ValueError as exc:  # e.g. EmptyCompletionError outside the core mapping
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         else:
-            with kanban_db.write_txn(conn):
-                if title is not None and payload.body is not None:
-                    conn.execute("UPDATE tasks SET title = ?, body = ? WHERE id = ?", (title, payload.body, task_id))
-                elif title is not None:
-                    conn.execute("UPDATE tasks SET title = ? WHERE id = ?", (title, task_id))
-                else:
-                    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (payload.body, task_id))
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            core._patch_title_body(conn, task_id, core.UpdateTaskBody(title=title, body=payload.body), resolved)
         return {"task": _task_payload(conn, task_id)}
-    finally:
-        conn.close()
 
 
 @router.post("/tasks/{task_id}/comments")

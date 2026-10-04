@@ -31,7 +31,7 @@ def test_serialize_graph_returns_nodes_edges_and_metadata():
 
     payload = serialize_graph(tasks, rows, board_slug='default', latest_event_id=9)
 
-    assert payload['board'] == {'slug': 'default', 'latest_event_id': 9}
+    assert payload['board'] == {'slug': 'default', 'latest_event_id': 9, 'initialized': True}
     assert [node['id'] for node in payload['nodes']] == ['parent', 'child', 'isolated']
     assert payload['nodes'][1]['assignee'] == 'default'
     assert payload['nodes'][1]['tenant'] == 'wiki'
@@ -49,3 +49,31 @@ def test_serialize_graph_truncates_large_descriptions_and_summaries():
 
     assert len(node['body']) == 2000
     assert len(node['latest_summary']) == 1000
+
+
+def test_links_to_hidden_tasks_are_counted_not_dropped_silently():
+    tasks = [Task('child', 'Child', None, 'todo', 0, None, None, 1), Task('parent', 'Parent', None, 'ready', 0, None, None, 2)]
+    rows = [
+        {'parent_id': 'archived-parent', 'child_id': 'child'},
+        {'parent_id': 'parent', 'child_id': 'archived-child'},
+        {'parent_id': 'ghost', 'child_id': 'child'},
+        {'parent_id': 'parent', 'child_id': 'child'},
+        {'parent_id': 'parent', 'child_id': 'child'},
+        {'parent_id': 'child', 'child_id': 'child'},
+    ]
+    payload = serialize_graph(
+        tasks, rows, board_slug='b', latest_event_id=1,
+        known_ids=['child', 'parent', 'archived-parent', 'archived-child'], archived_count=2,
+    )
+    nodes = {node['id']: node for node in payload['nodes']}
+    assert nodes['child']['hidden_parent_count'] == 1
+    assert nodes['parent']['hidden_child_count'] == 1
+    assert payload['edges'] == [{'id': 'parent->child', 'source': 'parent', 'target': 'child'}]
+    assert payload['archived_count'] == 2
+
+
+def test_node_cap_marks_payload_truncated():
+    tasks = [Task(f't{i}', 'T', None, 'todo', 0, None, None, i) for i in range(5)]
+    payload = serialize_graph(tasks, [], board_slug='b', latest_event_id=0, max_nodes=3)
+    assert len(payload['nodes']) == 3
+    assert payload['truncated'] is True

@@ -8,6 +8,14 @@ from pydantic import ValidationError
 from backend.dashboard import plugin_api
 
 
+def _connect(board='default'):
+    connect = getattr(plugin_api.kanban_db, 'connect', None)
+    if connect is None:
+        from hermes_cli import kanban_db_connect
+        connect = kanban_db_connect.connect
+    return connect(board=board)
+
+
 def test_write_payloads_allow_status_but_reject_other_task_fields():
     payload = plugin_api.TaskContentPatch.model_validate({'status': 'ready'})
     assert payload.status == 'ready'
@@ -43,12 +51,16 @@ class Connection:
         self.closed = False
         self.pragmas = []
 
-    def execute(self, query):
+    def execute(self, query, params=()):
         if query.startswith('PRAGMA '):
             self.pragmas.append(query)
             return Cursor([])
         if 'MAX(id)' in query:
             return Cursor([Row(m=7)])
+        if query == 'SELECT id FROM tasks':
+            return Cursor([Row(id='parent'), Row(id='child')])
+        if "status = 'archived'" in query:
+            return Cursor([Row(n=3)])
         if 'task_links' in query:
             return Cursor([Row(parent_id='parent', child_id='child')])
         raise AssertionError(query)
@@ -120,14 +132,18 @@ class FakeKanban:
         ]
 
 
-def test_graph_endpoint_returns_one_read_only_projection(monkeypatch):
+def test_graph_endpoint_returns_one_read_only_projection(monkeypatch, tmp_path):
     fake = FakeKanban()
+    db = tmp_path / 'kanban.db'
+    db.touch()
+    fake.kanban_db_path = lambda board=None: db
     monkeypatch.setattr(plugin_api, 'kanban_db', fake)
     monkeypatch.setattr(plugin_api, '_connection', lambda _path: fake.connection)
 
     payload = plugin_api.graph(board='default', include_archived=False)
 
-    assert payload['board'] == {'slug': 'default', 'latest_event_id': 7}
+    assert payload['board'] == {'slug': 'default', 'latest_event_id': 7, 'initialized': True}
+    assert payload['archived_count'] == 3
     assert payload['nodes'][0]['latest_summary'] == 'summary'
     assert payload['edges'] == [{'id': 'parent->child', 'source': 'parent', 'target': 'child'}]
     assert fake.connection.closed is True
@@ -227,7 +243,7 @@ def test_connection_closes_when_read_only_setup_fails(monkeypatch, tmp_path):
 def editable_task(monkeypatch, tmp_path):
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
-    conn = plugin_api.kanban_db.connect(board='default')
+    conn = _connect('default')
     try:
         task_id = plugin_api.kanban_db.create_task(
             conn,
@@ -264,21 +280,32 @@ def test_status_patch_uses_canonical_transitions(editable_task):
     )
     assert ready['task']['status'] == 'ready'
 
+    with pytest.raises(HTTPException) as no_evidence:
+        plugin_api.update_task_content(
+            editable_task,
+            plugin_api.TaskContentPatch(status='done'),
+            board='default',
+        )
+    assert no_evidence.value.status_code == 400
+    assert 'evidence' in no_evidence.value.detail
+
     done = plugin_api.update_task_content(
         editable_task,
-        plugin_api.TaskContentPatch(status='done'),
+        plugin_api.TaskContentPatch(status='done', summary='  Shipped from the graph  '),
         board='default',
     )
     assert done['task']['status'] == 'done'
+    assert done['task']['latest_summary'] == 'Shipped from the graph'
 
     detail = plugin_api.task_detail(editable_task, board='default')
-    assert [event['kind'] for event in detail['events'][-2:]] == ['unblocked', 'completed']
+    assert detail['events'][-1]['kind'] == 'completed'
+    assert 'unblocked' in [event['kind'] for event in detail['events']]
 
 
 def test_ready_status_rejects_unfinished_parent(monkeypatch, tmp_path):
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
-    conn = plugin_api.kanban_db.connect(board='default')
+    conn = _connect('default')
     try:
         parent = plugin_api.kanban_db.create_task(conn, title='Parent', initial_status='blocked', board='default')
         assert plugin_api.kanban_db.unblock_task(conn, parent)
@@ -298,7 +325,7 @@ def test_ready_status_rejects_unfinished_parent(monkeypatch, tmp_path):
     assert blocked.value.status_code == 409
     assert 'Parent' in blocked.value.detail
 
-    conn = plugin_api.kanban_db.connect(board='default')
+    conn = _connect('default')
     try:
         with plugin_api.kanban_db.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
@@ -354,3 +381,114 @@ def test_route_surface_keeps_dependency_links_read_only():
     assert ('/tasks/{task_id}', frozenset({'PATCH'})) in routes
     assert ('/tasks/{task_id}/comments', frozenset({'POST'})) in routes
     assert not any('links' in path and methods & {'POST', 'PATCH', 'PUT', 'DELETE'} for path, methods in routes)
+
+
+def test_summary_is_only_accepted_with_done(editable_task):
+    with pytest.raises(HTTPException) as error:
+        plugin_api.update_task_content(
+            editable_task,
+            plugin_api.TaskContentPatch(status='ready', summary='nope'),
+            board='default',
+        )
+    assert error.value.status_code == 400
+
+
+def test_archived_parent_satisfies_ready_like_the_official_board(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    conn = _connect('default')
+    try:
+        parent = plugin_api.kanban_db.create_task(conn, title='Parent', initial_status='blocked', board='default')
+        child = plugin_api.kanban_db.create_task(conn, title='Child', initial_status='blocked', board='default')
+        plugin_api.kanban_db.link_tasks(conn, parent, child)
+        assert plugin_api.kanban_db.archive_task(conn, parent)
+        with plugin_api.kanban_db.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
+    finally:
+        conn.close()
+
+    moved = plugin_api.update_task_content(child, plugin_api.TaskContentPatch(status='ready'), board='default')
+    assert moved['task']['status'] == 'ready'
+
+
+def test_title_edit_fires_core_update_hook(editable_task, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        plugin_api.kanban_db,
+        'notify_task_updated',
+        lambda conn, task_id, fields, board=None: seen.append((task_id, list(fields), board)),
+    )
+    plugin_api.update_task_content(editable_task, plugin_api.TaskContentPatch(title='Renamed'), board='default')
+    assert seen == [(editable_task, ['title'], 'default')]
+
+
+def test_writes_refuse_instead_of_diverging_when_core_backend_is_missing(editable_task, monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin_api, '_core_module', None)
+    monkeypatch.setattr(plugin_api, '_core_dashboard_path', lambda: tmp_path / 'missing' / 'plugin_api.py')
+    monkeypatch.setattr(plugin_api, '_CORE_REQUIRED', ('_definitely_not_a_core_symbol',))
+    with pytest.raises(HTTPException) as error:
+        plugin_api.update_task_content(editable_task, plugin_api.TaskContentPatch(status='todo'), board='default')
+    assert error.value.status_code == 503
+
+
+def test_detail_hides_worker_internals(editable_task):
+    task = plugin_api.task_detail(editable_task, board='default')['task']
+    assert not {'claim_lock', 'claim_expires', 'worker_pid', 'worker_started_at'} & set(task)
+
+
+def test_read_connection_authorizer_denies_writes(tmp_path):
+    import sqlite3
+
+    path = tmp_path / 'kanban.db'
+    raw = sqlite3.connect(path)
+    raw.execute('CREATE TABLE tasks (id TEXT, status TEXT)')
+    raw.execute("INSERT INTO tasks VALUES ('a', 'ready')")
+    raw.commit()
+    raw.close()
+
+    conn = plugin_api._connection(path)
+    try:
+        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+        for statement in ("INSERT INTO tasks VALUES ('b', 'todo')", 'DROP TABLE tasks', "ATTACH DATABASE ':memory:' AS x"):
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute(statement)
+    finally:
+        conn.close()
+
+
+def test_graph_for_uninitialized_board_is_empty_and_creates_nothing(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    payload = plugin_api.graph(board='default', include_archived=False)
+    assert payload['board']['initialized'] is False
+    assert payload['nodes'] == [] and payload['edges'] == []
+    assert not (tmp_path / 'kanban.db').exists()
+
+
+def test_boards_report_counts_and_skip_archived_boards(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
+    plugin_api.kanban_db.create_board('work', name='工作')
+    plugin_api.kanban_db.create_board('old', name='Old')
+    plugin_api.kanban_db.write_board_metadata('old', archived=True)
+    conn = _connect('work')
+    try:
+        plugin_api.kanban_db.create_task(conn, title='一个任务', initial_status='blocked', board='work')
+        done = plugin_api.kanban_db.create_task(conn, title='归档', initial_status='blocked', board='work')
+        plugin_api.kanban_db.archive_task(conn, done)
+    finally:
+        conn.close()
+
+    payload = plugin_api.boards()
+    by_slug = {item['slug']: item for item in payload['boards']}
+    assert by_slug['work']['name'] == '工作'
+    assert by_slug['work']['total'] == 1
+    assert by_slug['work']['by_status'] == {'blocked': 1, 'archived': 1}
+    assert by_slug['old']['archived'] is True and 'total' not in by_slug['old']
+    assert by_slug['default']['initialized'] is False
+    assert not any('db_path' in item for item in payload['boards'])
+
+    graph = plugin_api.graph(board='work', include_archived=False)
+    assert [node['title'] for node in graph['nodes']] == ['一个任务']
+    assert graph['archived_count'] == 1
