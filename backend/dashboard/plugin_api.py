@@ -1,9 +1,3 @@
-"""
-[INPUT]: 依赖 hermes_cli.kanban_db 的看板路径与读取能力, hermes_cli.kanban_workflow 的手动迁移矩阵, 核心 Kanban dashboard 后端 (plugins/kanban/dashboard/plugin_api.py) 的写入处理器
-[OUTPUT]: 对外提供 router: /health /boards /workflow /graph /tasks/{id} 只读路由, PATCH /tasks/{id}, POST /tasks/{id}/comments, POST /dispatch 委托写入
-[POS]: backend/dashboard 的 HTTP 层; 消费者: src/plugin.tsx 经 ctx.rest 调用; 与 graph_data.py 的边界: 本文件负责读库与委托核心, graph_data 只做投影序列化
-[PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
-"""
 from __future__ import annotations
 
 import importlib.util

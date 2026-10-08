@@ -1,9 +1,3 @@
-"""
-[INPUT]: 依赖 调用方传入的任务行与 task_links 行 (无数据库访问)
-[OUTPUT]: 对外提供 serialize_graph / empty_graph: 只读图投影 (节点白名单字段, 去重边, 归档隐藏与截断隐藏的依赖计数)
-[POS]: backend/dashboard 的序列化层; 消费者: plugin_api.graph; 与 plugin_api.py 的边界: 不读库、不解析看板
-[PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
-"""
 from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional
