@@ -6,10 +6,10 @@ A standalone Hermes Desktop plugin that renders the existing Kanban task graph a
 
 [Senci/hermes-kanban-graph](https://github.com/Senci/hermes-kanban-graph) is an independent community plugin with the same name, built around the same time. It is a **read-only, all-boards** observatory with a live event stream, worker run history, deep links and a static HTML snapshot. Use it if that is what you need.
 
-This plugin focuses on **working on one board inside the graph**:
+This plugin focuses on **working on the board(s) inside the graph**:
 
 - Edit status (only the moves core Kanban allows), title and description, and add comments, all delegated to core Kanban handlers.
-- Follow the board selected on the Kanban page, or pin any other board.
+- Follow the board selected on the Kanban page, pin any other board, or show **all boards** at once, still editable.
 - Drag cards and keep their positions per board, with filters for status, assignee, tenant, archived and linked-only.
 - Chinese and English UI.
 
@@ -22,7 +22,9 @@ The two plugins are unrelated codebases, but **both use the plugin id `kanban-gr
 - Dagre left-to-right or top-to-bottom layout
 - Persistent Straight, Elbow, and Curve connection styles with low-saturation status gradients
 - Semantic connection motion: running paths flow, blocked endpoints breathe, selected paths trace direction, and completed paths remain still and muted
-- Multi-board: **Follow Kanban** (default) shows whatever board the bundled Kanban page has selected (read from its persisted choice, per connection; a board just created there is picked up at once); or pin any board. Archived boards (and `boards/_archived/`) are ignored; the switcher shows open-task counts and sits in the workspace page header on hosts that support it
+- Multi-board: **Follow Kanban** (default) shows whatever board the bundled Kanban page has selected (read from its persisted choice, per connection; a board just created there is picked up at once); or pin any board. Archived boards (and `boards/_archived/`) are ignored
+- The board switcher matches core Kanban's: the same flat tab in the workspace page header (project icon, muted **Board** label, board name, open-task count, chevron; `h-7` when it falls back inline into the toolbar). Following is marked by a small link icon; the menu lists Follow Kanban, **All boards** with its total, and every board with its count, with a check on the active entry
+- **All boards** view: every open board in one graph, each in its own labelled band (the followed board first, then alphabetically), laid out per board with the same Dagre + unlinked-grid layout and stacked along the cross axis. Cards keep their board: details, edits, comments, the status menu and the dispatcher nudge all go to the task's own board, and the drawer names it. Status chips, search, filters and counts span every board, with an extra board filter. Live push opens one socket per initialized board (up to 12; beyond that it polls), counting as live only while every socket is. Positions are saved in their own `*all*` context and never overwrite per-board ones. Backed by `GET /graph/all` (read-only, archived and uninitialized boards skipped, per-board 5,000 and global 10,000 task caps reported honestly)
 - Connection-safe: queries only run, and edits only send, while their cache scope is the connection requests are routed to, so switching gateways never mixes boards
 - Unlinked tasks are not forced into a Dagre rank: they sit in a sorted grid under a collapsible **Unlinked tasks** header
 - Links that are implied by a longer path are drawn faint and kept out of Dagre ranking; they can be hidden. Reachability is computed once per graph, so large boards have no edge-count cutoff
@@ -72,9 +74,9 @@ The Desktop renderer hot-reloads (fallback: ⌘K → **Reload desktop plugins**)
 
 ## Architecture
 
-- `backend/dashboard/plugin_api.py`: namespaced FastAPI graph/detail routes and whitelisted task-content/comment mutations
+- `backend/dashboard/plugin_api.py`: namespaced FastAPI graph (`/graph`, `/graph/all`)/detail routes and whitelisted task-content/comment mutations
 - `backend/dashboard/graph_data.py`: stable graph projection serializer
-- `src/graph.ts`: pure filtering, statistics, and Dagre layout
+- `src/graph.ts`: pure filtering, statistics, Dagre layout, and the all-boards band layout
 - `src/plugin.tsx`: Hermes Desktop route and React Flow UI
 - `src/ui.tsx`: Kanban-aligned cards, filters, graph settings, board switcher, and detail drawer
 - `build.mjs`: bundles all third-party UI code while externalizing the host React and `@hermes/plugin-sdk`
