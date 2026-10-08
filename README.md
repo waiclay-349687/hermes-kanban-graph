@@ -9,20 +9,26 @@ A standalone Hermes Desktop plugin that renders the existing Kanban task graph a
 - Dagre left-to-right or top-to-bottom layout
 - Persistent Straight, Elbow, and Curve connection styles with low-saturation status gradients
 - Semantic connection motion: running paths flow, blocked endpoints breathe, selected paths trace direction, and completed paths remain still and muted
-- Multi-board: **Follow Kanban** (default) shows whatever board the bundled Kanban page has selected (read from its persisted choice, per connection); or pin any board. Archived boards (and `boards/_archived/`) are ignored; the switcher shows open-task counts
+- Multi-board: **Follow Kanban** (default) shows whatever board the bundled Kanban page has selected (read from its persisted choice, per connection; a board just created there is picked up at once); or pin any board. Archived boards (and `boards/_archived/`) are ignored; the switcher shows open-task counts and sits in the workspace page header on hosts that support it
+- Connection-safe: queries only run, and edits only send, while their cache scope is the connection requests are routed to, so switching gateways never mixes boards
 - Unlinked tasks are not forced into a Dagre rank: they sit in a sorted grid under a collapsible **Unlinked tasks** header
-- Links that are implied by a longer path are drawn faint and kept out of Dagre ranking; they can be hidden
-- Status colours/icons identical to the Kanban board; per-status chips that filter; unmet-prerequisite and hidden (archived) link badges
-- Empty states for uninitialized, fully archived, and filtered-out boards
+- Links that are implied by a longer path are drawn faint and kept out of Dagre ranking; they can be hidden. Reachability is computed once per graph, so large boards have no edge-count cutoff
+- Dagre only re-runs when the linked structure changes; status/summary updates, heartbeats and search typing do not re-layout, and a card being dragged is never reset by a refresh
+- Status colours/icons identical to the Kanban board; per-status chips that filter; unmet-prerequisite, hidden (archived) and beyond-the-limit link badges, counted separately
+- Empty states for uninitialized, fully archived, and filtered-out boards; boards over 5,000 tasks say how many are shown and that filters only cover those
 - English and Simplified Chinese UI (follows the app locale)
 - Search and status/assignee/tenant/archive/linked-task filters
 - Relationship focus with unrelated cards and edges dimmed
-- Official Kanban-aligned task cards and detail drawer with status, title, and description editing plus comments, activity, results, and dependencies
+- Official Kanban-aligned task cards and detail drawer with status, title, and description editing plus comments, activity (no heartbeats, newest 50 events), results, and dependencies
+- The status menu offers only the moves core's workflow accepts from the current status (`GET /workflow`); completing a task that already has a result keeps it; a status change nudges the dispatcher like the Kanban board does
+- Saving never discards newer input typed while the request was in flight; Escape cancels the editor or menu it was pressed in, and only closes the drawer otherwise
+- **Open in Kanban** checks that the bundled Kanban page is enabled (it ships off) and names the board it will show when the graph is pinned to another one
 - Clickable parent/child relationships inside the detail drawer
-- Persistent MiniMap, dot-grid, layout, connection motion, connection preferences, and per-board manual node positions
+- Persistent MiniMap, dot-grid, layout, connection motion, connection preferences, and per-board manual node positions (kept only while a card stays linked/unlinked, pruned when tasks disappear, capped in size)
+- Toggling **Show archived** keeps the canvas, zoom and pan, with a small updating indicator
 - Hermes light/dark theme support
 - Read-only graph/detail SQLite queries (`mode=ro` + `query_only` + a deny-all-writes authorizer); edits are delegated to the bundled Kanban backend
-- 10-second React Query refresh fallback
+- 10-second graph refresh, 30-second open-task refresh; the refresh button also reloads the open task
 
 ## Development
 
@@ -64,7 +70,9 @@ The final runtime bundle is checked to contain no unsupported external imports.
 
 ## Safety
 
-Graph, board, detail, and dependency reads open SQLite with URI `mode=ro`, `PRAGMA query_only=ON`, and an authorizer that denies every non-read statement; a missing board database is reported, never created. The only write routes are `PATCH /tasks/{id}` for `title`/`body` or an operator-controlled `status` (plus an optional completion `summary`, which Kanban requires to mark a card done), and `POST /tasks/{id}/comments` with a server-fixed author. System-owned states (`scheduled`, `running`, and `review`) cannot be selected manually. Status and content edits call the bundled Kanban dashboard's own handlers (`_patch_status`, `_patch_title_body`), so worker termination, forced completion, done/archived parent gating, descendant invalidation, and lifecycle hooks are identical to dragging a card on the board; if those handlers are missing the edit is refused (503) rather than run through divergent code. Gradients, motion, and connection geometry are display-only. There are no dependency-link write routes: `task_links` remains strictly read only.
+An omitted `board` resolves exactly like core (`kanban_db_path(None)`), so a `HERMES_KANBAN_DB` pin and the worker fence apply the same way; there is no plugin-specific board lock.
+
+Graph, board, detail, and dependency reads open SQLite with URI `mode=ro`, `PRAGMA query_only=ON`, and an authorizer that denies every non-read statement; a missing board database is reported, never created. The only write routes are `PATCH /tasks/{id}` for `title`/`body` or an operator-controlled `status` (plus an optional completion `summary`, which Kanban requires to mark a card done), `POST /tasks/{id}/comments` with a server-fixed author, and `POST /dispatch`, which calls core's dispatcher nudge with explicit arguments. System-owned states (`scheduled`, `running`, and `review`) cannot be selected manually. Status and content edits call the bundled Kanban dashboard's own handlers (`_patch_status`, `_patch_title_body`), and comments go through core's `_board_conn` + `kanban_db.add_comment`, so worker termination, forced completion, done/archived parent gating, descendant invalidation, and lifecycle hooks are identical to dragging a card on the board; if those handlers are missing the edit is refused (503) rather than run through divergent code. Gradients, motion, and connection geometry are display-only. There are no dependency-link write routes: `task_links` remains strictly read only.
 
 ## License
 

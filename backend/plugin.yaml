@@ -1,6 +1,6 @@
 manifest_version: 1
 name: kanban-graph
-version: "0.2.0"
+version: "0.3.0"
 description: Kanban dependency graph; follows the Kanban board, edits via core Kanban, read-only links
 kind: standalone
 provides_tools: []
