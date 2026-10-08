@@ -608,7 +608,12 @@ export function Inspector({
     setCompletionSummary('')
   }
   // Escape inside an editor cancels that editor only; the drawer stays open.
-  const onEscape = (cancel: () => void) => (event: KeyboardEvent) => {
+  const onEscape = (cancel: () => void, submit?: () => void, plainEnter = false) => (event: KeyboardEvent) => {
+    if (event.key === 'Enter' && submit && !event.nativeEvent.isComposing && event.keyCode !== 229 && !event.shiftKey && (plainEnter || event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      submit()
+      return
+    }
     if (event.key !== 'Escape') return
     event.preventDefault()
     event.stopPropagation()
@@ -651,7 +656,7 @@ export function Inspector({
         </div>
         {detailReady && (editingTitle ? (
           <div className="hkg-title-editor">
-            <Input autoFocus onChange={(event: ChangeEvent<HTMLInputElement>) => setDraftTitle(event.target.value)} onKeyDown={onEscape(cancelTitle)} value={draftTitle} />
+            <Input autoFocus onChange={(event: ChangeEvent<HTMLInputElement>) => setDraftTitle(event.target.value)} onKeyDown={onEscape(cancelTitle, () => { if (!savingContent && draftTitle.trim()) void saveTitle() }, true)} value={draftTitle} />
             <div className="hkg-inline-editor-actions">
               <Button disabled={savingContent} onClick={cancelTitle} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
               <Button disabled={savingContent || !draftTitle.trim()} onClick={() => void saveTitle()} size="xs" variant="primary">{savingContent ? <Loader size="xs" /> : t('inspector.save')}</Button>
@@ -664,7 +669,7 @@ export function Inspector({
           <div className="hkg-complete-form">
             <div className="hkg-section-label">{t('inspector.completeTitle')}</div>
             <p className="hkg-drawer-muted">{t('inspector.completeHint')}</p>
-            <Textarea autoFocus onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setCompletionSummary(event.target.value)} onKeyDown={onEscape(cancelCompletion)} placeholder={t('inspector.completePlaceholder')} value={completionSummary} />
+            <Textarea autoFocus onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setCompletionSummary(event.target.value)} onKeyDown={onEscape(cancelCompletion, () => void submitCompletion())} placeholder={t('inspector.completePlaceholder')} value={completionSummary} />
             <div className="hkg-inline-editor-actions">
               <Button disabled={savingStatus} onClick={cancelCompletion} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
               <Button disabled={savingStatus || !completionSummary.trim()} onClick={() => void submitCompletion()} size="xs" variant="primary">{savingStatus ? <Loader size="xs" /> : t('inspector.complete')}</Button>
@@ -689,7 +694,7 @@ export function Inspector({
           <div className="hkg-section-label">{t('inspector.description')}<Button aria-label={t('inspector.editDescription')} onClick={() => setEditingBody(true)} size="icon-xs" variant="ghost"><Codicon name="edit" size="0.7rem" /></Button></div>
           {editingBody ? (
             <div className="hkg-body-editor-wrap">
-              <Textarea autoFocus className="hkg-body-editor" onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setDraftBody(event.target.value)} onKeyDown={onEscape(cancelBody)} placeholder={t('inspector.descriptionPlaceholder')} value={draftBody} />
+              <Textarea autoFocus className="hkg-body-editor" onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setDraftBody(event.target.value)} onKeyDown={onEscape(cancelBody, () => { if (!savingContent) void saveBody() })} placeholder={t('inspector.descriptionPlaceholder')} value={draftBody} />
               <div className="hkg-inline-editor-actions">
                 <Button disabled={savingContent} onClick={cancelBody} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
                 <Button disabled={savingContent} onClick={() => void saveBody()} size="xs" variant="primary">{savingContent ? <Loader size="xs" /> : t('inspector.save')}</Button>
@@ -731,7 +736,7 @@ export function Inspector({
             </div>
           )}
           <div className="hkg-comment-composer">
-            <Textarea onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setComment(event.target.value)} onKeyDown={onEscape(() => (document.activeElement as HTMLElement | null)?.blur())} placeholder={t('inspector.commentPlaceholder')} value={comment} />
+            <Textarea onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setComment(event.target.value)} onKeyDown={onEscape(() => (document.activeElement as HTMLElement | null)?.blur(), () => { if (!savingComment && comment.trim()) void addComment() })} placeholder={t('inspector.commentPlaceholder')} value={comment} />
             <Button disabled={savingComment || !comment.trim()} onClick={() => void addComment()} size="xs" variant="primary">
               {savingComment ? <Loader size="xs" /> : <Codicon name="send" size="0.7rem" />}{t('inspector.comment')}
             </Button>

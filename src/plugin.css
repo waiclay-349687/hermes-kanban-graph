@@ -327,3 +327,5 @@
 @media (prefers-reduced-motion: reduce) { .hkg-node-status .codicon { animation: none !important; } }
 .hkg-root .hkg-status-edge-implied { opacity: .3; stroke-dasharray: 2 4; filter: none; }
 .hkg-root .react-flow__edge.hkg-edge-related .hkg-status-edge-implied { opacity: .7; }
+
+.hkg-board-switcher-host { display: contents; }

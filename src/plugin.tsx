@@ -326,11 +326,36 @@ function escapeIsForInnerControl(event: KeyboardEvent): boolean {
 }
 
 /** Board switcher placement: the workspace page header on hosts that have it. */
+// The page header is only painted while the host treats the workspace as a
+// page. A disk plugin's route registers after the first route resolution, so
+// after a reload on /kanban-graph the header can still show session tabs and
+// the projected switcher is never mounted. Then render it inline instead.
 function PageHeaderControl({ children }: { children: ReactNode }) {
   const HeaderControl = sdk.WorkspacePageHeaderControl
+  const [inline, setInline] = useState(false)
+  useEffect(() => {
+    if (!HeaderControl || inline) return
+    const check = () => {
+      if (!document.querySelector('[data-hkg-board-switcher]')) setInline(true)
+    }
+    const timer = window.setTimeout(check, 600)
+    const observer = new MutationObserver(() => {
+      if (!document.querySelector('[data-hkg-board-switcher]')) {
+        window.clearTimeout(timer)
+        window.setTimeout(check, 200)
+      }
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+    return () => {
+      window.clearTimeout(timer)
+      observer.disconnect()
+    }
+  }, [HeaderControl, inline])
+  const marked = <span className="hkg-board-switcher-host" data-hkg-board-switcher="">{children}</span>
+  if (inline) return marked
   return HeaderControl
-    ? <HeaderControl id="kanban-graph:board-switcher">{children}</HeaderControl>
-    : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{children}</Contribute>
+    ? <HeaderControl id="kanban-graph:board-switcher">{marked}</HeaderControl>
+    : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{marked}</Contribute>
 }
 
 function TaskInspectorController({
