@@ -655,7 +655,7 @@ export function Inspector({
           </div>
         </div>
         {detailReady && (editingTitle ? (
-          <div className="hkg-title-editor">
+          <div className="hkg-title-editor" onKeyDown={onEscape(cancelTitle)}>
             <Input autoFocus onChange={(event: ChangeEvent<HTMLInputElement>) => setDraftTitle(event.target.value)} onKeyDown={onEscape(cancelTitle, () => { if (!savingContent && draftTitle.trim()) void saveTitle() }, true)} value={draftTitle} />
             <div className="hkg-inline-editor-actions">
               <Button disabled={savingContent} onClick={cancelTitle} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
@@ -666,7 +666,7 @@ export function Inspector({
           <div className="hkg-title-row"><h2>{task.title || task.id}</h2><Button aria-label={t('inspector.editTitle')} onClick={() => setEditingTitle(true)} size="icon-xs" variant="ghost"><Codicon name="edit" /></Button></div>
         ))}
         {completing && (
-          <div className="hkg-complete-form">
+          <div className="hkg-complete-form" onKeyDown={onEscape(cancelCompletion)}>
             <div className="hkg-section-label">{t('inspector.completeTitle')}</div>
             <p className="hkg-drawer-muted">{t('inspector.completeHint')}</p>
             <Textarea autoFocus onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setCompletionSummary(event.target.value)} onKeyDown={onEscape(cancelCompletion, () => void submitCompletion())} placeholder={t('inspector.completePlaceholder')} value={completionSummary} />
@@ -693,7 +693,7 @@ export function Inspector({
         <section className="hkg-drawer-section hkg-description-section">
           <div className="hkg-section-label">{t('inspector.description')}<Button aria-label={t('inspector.editDescription')} onClick={() => setEditingBody(true)} size="icon-xs" variant="ghost"><Codicon name="edit" size="0.7rem" /></Button></div>
           {editingBody ? (
-            <div className="hkg-body-editor-wrap">
+            <div className="hkg-body-editor-wrap" onKeyDown={onEscape(cancelBody)}>
               <Textarea autoFocus className="hkg-body-editor" onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setDraftBody(event.target.value)} onKeyDown={onEscape(cancelBody, () => { if (!savingContent) void saveBody() })} placeholder={t('inspector.descriptionPlaceholder')} value={draftBody} />
               <div className="hkg-inline-editor-actions">
                 <Button disabled={savingContent} onClick={cancelBody} size="xs" variant="ghost">{t('inspector.cancel')}</Button>

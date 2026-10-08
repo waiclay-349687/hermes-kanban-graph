@@ -562,10 +562,20 @@ export function capPositionStore(store: PositionStore, max = MAX_SAVED_POSITIONS
   const next: PositionStore = {}
   let total = 0
   for (const [context, entry] of contexts) {
-    const size = Object.keys(entry.positions).length
-    if (total > 0 && total + size > max) continue
-    next[context] = entry
-    total += size
+    const ids = Object.keys(entry.positions)
+    if (total >= max) break
+    if (total + ids.length <= max) {
+      next[context] = entry
+      total += ids.length
+      continue
+    }
+    // The newest context alone exceeds the cap: keep its most recently written
+    // positions (insertion order) so the cap is hard.
+    if (total === 0) {
+      const keep = ids.slice(ids.length - max)
+      next[context] = { at: entry.at, positions: Object.fromEntries(keep.map(id => [id, entry.positions[id]])) }
+      total = max
+    }
   }
   return next
 }

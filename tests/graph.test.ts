@@ -506,6 +506,15 @@ describe('saved positions', () => {
     expect(Object.keys(capPositionStore(store, 2))).toEqual(['new'])
     expect(Object.keys(capPositionStore(store, 3)).sort()).toEqual(['new', 'old'])
   })
+
+  it('caps a single oversized context hard, keeping its newest positions', () => {
+    const positions = Object.fromEntries(Array.from({ length: 3001 }, (_, i) => [`t${i}`, { x: i, y: 0, linked: true }]))
+    const capped = capPositionStore({ big: { at: 1, positions } }, 3000)
+    const ids = Object.keys(capped.big!.positions)
+    expect(ids).toHaveLength(3000)
+    expect(ids[0]).toBe('t1')
+    expect(ids.at(-1)).toBe('t3000')
+  })
 })
 
 describe('core Kanban availability', () => {

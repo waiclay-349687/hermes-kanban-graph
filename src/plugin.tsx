@@ -153,6 +153,15 @@ function routedScope(): null | string {
   return typeof read === 'function' ? read() ?? LOCAL_SCOPE : null
 }
 
+/** REST read bound to the scope baked into its query key. `enabled` does not
+ *  gate an explicit `refetch()`, so the check lives in the fetch itself: a
+ *  request for an outgoing scope never reaches the incoming gateway. */
+function scopedGet<T>(scope: string, path: string): Promise<T> {
+  const routed = routedScope()
+  if (routed !== null && routed !== scope) return Promise.reject(new Error('stale connection scope'))
+  return api!<T>(path)
+}
+
 /** Every graph query key is `['kanban-graph', version, scope, ...]`. */
 const routedToScope = (query: { queryKey: readonly unknown[] }): boolean => keyInRoutedScope(query.queryKey, routedScope())
 
@@ -317,7 +326,7 @@ function installSidebarToggle(navLabel: () => string) {
 /** Escape that belongs to a field, menu or popover: let that thing handle it. */
 function escapeIsForInnerControl(event: KeyboardEvent): boolean {
   const target = event.target
-  if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="menu"], [role="listbox"]')) {
+  if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="menu"], [role="listbox"], .hkg-title-editor, .hkg-complete-form, .hkg-body-editor-wrap')) {
     return true
   }
   if (document.querySelector('[role="menu"], [role="listbox"]')) return true
@@ -393,7 +402,7 @@ function TaskInspectorController({
   const taskPath = `/tasks/${encodeURIComponent(task.id)}?board=${encodeURIComponent(board)}`
   const detailQuery = useQuery<TaskDetail>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'task', board, task.id],
-    queryFn: () => api!(taskPath),
+    queryFn: () => scopedGet<TaskDetail>(scope, taskPath),
     enabled: routedToScope,
     refetchInterval: DETAIL_POLL_MS
   })
@@ -522,19 +531,23 @@ function GraphPage() {
   // Search runs on every card; let typing stay responsive on large boards.
   const deferredQuery = useDeferredValue(filters.query)
 
-  // A different gateway has different boards: reload that connection's choice.
-  useEffect(() => setSelection(loadBoardSelection(scope)), [scope])
+  // A different gateway has different boards: reload that connection's choice
+  // and drop the open card (it belongs to the other gateway).
+  useEffect(() => {
+    setSelection(loadBoardSelection(scope))
+    setSelectedId(null)
+  }, [scope])
 
   const boardsQuery = useQuery<BoardsResponse>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'boards'],
-    queryFn: () => api!('/boards'),
+    queryFn: () => scopedGet<BoardsResponse>(scope, '/boards'),
     enabled: routedToScope,
     staleTime: 15_000,
     refetchInterval: 30_000
   })
   const workflowQuery = useQuery<WorkflowResponse>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'workflow'],
-    queryFn: () => api!('/workflow'),
+    queryFn: () => scopedGet<WorkflowResponse>(scope, '/workflow'),
     enabled: routedToScope,
     staleTime: 5 * 60_000
   })
@@ -554,10 +567,12 @@ function GraphPage() {
   })
   const graphQuery = useQuery<GraphPayload>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'graph', boardValue, includeArchived],
-    queryFn: () => api!(`/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`),
+    queryFn: () => scopedGet<GraphPayload>(scope, `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`),
     enabled: query => Boolean(boardValue) && routedToScope(query),
     // Same board, other archive filter: keep the canvas (and its zoom) while loading.
-    placeholderData: previous => (previous?.board.slug === boardValue ? previous : undefined),
+    // Only for the same connection: two gateways can both have a `default` board.
+    placeholderData: (previous, previousQuery) =>
+      previous && previousQuery?.queryKey[2] === scope && previous.board.slug === boardValue ? previous : undefined,
     // The event cursor moves on every worker heartbeat; without it an unchanged
     // board keeps its identity and nothing downstream recomputes.
     select: stripEventCursor,
@@ -566,6 +581,7 @@ function GraphPage() {
   const positionContext = boardValue
     ? (scope === LOCAL_SCOPE ? `${boardValue}:${settings.direction}` : `${scope}:${boardValue}:${settings.direction}`)
     : ''
+  const filtersActive = Boolean(filters.query.trim() || filters.status || filters.assignee || filters.tenant || filters.linkedOnly)
   const positionOverrides = positionContext ? positionStore[positionContext]?.positions ?? EMPTY_POSITIONS : EMPTY_POSITIONS
 
   const payload = boardValue && graphQuery.data?.board.slug === boardValue ? graphQuery.data : undefined
@@ -689,6 +705,8 @@ function GraphPage() {
   const patchSettings = (patch: Partial<ViewSettings>) => setSettings(current => ({ ...current, ...patch }))
   const fitView = () => void flowRef.current?.fitView({ ...FIT_OPTIONS, duration: 220 })
   const onNodesChange = (changes: NodeChange<GraphNode>[]) => {
+    // A drag cancelled by React Flow (multi-touch) never fires onNodeDragStop.
+    if (dragging && changes.some(change => change.type === 'position' && change.dragging === false)) setDragging(false)
     if (!positionContext) return
     setLiveNodes(current => {
       const reuse = current.context === positionContext && (dragging || current.signature === nodeSignature)
@@ -700,6 +718,10 @@ function GraphPage() {
     })
   }
   const persistNodePosition = (node: GraphNode) => {
+    // A filtered view has its own layout (hidden neighbours change a card's
+    // role and place); a drag there is kept on screen but never saved over the
+    // full-board position.
+    if (filtersActive) return
     if (!positionContext || !isTaskNode(node)) return
     writePositionStore(savePosition(positionStoreRef.current, positionContext, node.id, {
       x: node.position.x,
@@ -764,9 +786,9 @@ function GraphPage() {
   useEffect(() => pluginStorage?.set('view-settings', settings), [settings])
   // Core just created or imported a board we have not listed yet: refetch once.
   useEffect(() => {
-    if (!kanbanSlug || !boardsQuery.data || refetchedForSlugRef.current === kanbanSlug) return
+    if (!kanbanSlug || !boardsQuery.data || refetchedForSlugRef.current === `${scope}\u0000${kanbanSlug}`) return
     if (availableBoards.some(board => board.slug === kanbanSlug)) return
-    refetchedForSlugRef.current = kanbanSlug
+    refetchedForSlugRef.current = `${scope}\u0000${kanbanSlug}`
     void boardsQuery.refetch()
   }, [availableBoards, boardsQuery, kanbanSlug])
   // Drop saved positions of tasks that are gone. Only a complete payload (no

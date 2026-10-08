@@ -37,7 +37,7 @@ declare module '@hermes/plugin-sdk' {
     refetchInterval?: number
     refetchOnWindowFocus?: boolean
     enabled?: boolean | ((query: { queryKey: readonly unknown[] }) => boolean)
-    placeholderData?: (previous: T | undefined) => T | undefined
+    placeholderData?: (previous: T | undefined, previousQuery?: { queryKey: readonly unknown[] }) => T | undefined
     select?: (data: T) => T
     staleTime?: number
   }): {
