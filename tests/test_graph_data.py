@@ -77,3 +77,22 @@ def test_node_cap_marks_payload_truncated():
     payload = serialize_graph(tasks, [], board_slug='b', latest_event_id=0, max_nodes=3)
     assert len(payload['nodes']) == 3
     assert payload['truncated'] is True
+    assert payload['total_count'] == 5
+
+
+def test_links_to_truncated_tasks_are_counted_apart_from_archived_ones():
+    tasks = [Task(f't{i}', 'T', None, 'todo', 0, None, None, i) for i in range(4)]
+    rows = [
+        {'parent_id': 't3', 'child_id': 't0'},
+        {'parent_id': 'archived', 'child_id': 't0'},
+        {'parent_id': 't1', 'child_id': 't2'},
+    ]
+    payload = serialize_graph(
+        tasks, rows, board_slug='b', latest_event_id=0,
+        known_ids=['t0', 't1', 't2', 't3', 'archived'], archived_count=1, max_nodes=2,
+    )
+    nodes = {node['id']: node for node in payload['nodes']}
+    assert nodes['t0']['truncated_parent_count'] == 1
+    assert nodes['t0']['hidden_parent_count'] == 1
+    assert nodes['t1']['truncated_child_count'] == 1
+    assert nodes['t1']['hidden_child_count'] == 0

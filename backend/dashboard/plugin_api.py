@@ -1,8 +1,13 @@
+"""
+[INPUT]: 依赖 hermes_cli.kanban_db 的看板路径与读取能力, hermes_cli.kanban_workflow 的手动迁移矩阵, 核心 Kanban dashboard 后端 (plugins/kanban/dashboard/plugin_api.py) 的写入处理器
+[OUTPUT]: 对外提供 router: /health /boards /workflow /graph /tasks/{id} 只读路由, PATCH /tasks/{id}, POST /tasks/{id}/comments, POST /dispatch 委托写入
+[POS]: backend/dashboard 的 HTTP 层; 消费者: src/plugin.tsx 经 ctx.rest 调用; 与 graph_data.py 的边界: 本文件负责读库与委托核心, graph_data 只做投影序列化
+[PROTOCOL]: 变更时更新此头部,然后检查所在目录 CLAUDE.md
+"""
 from __future__ import annotations
 
 import importlib.util
 import logging
-import os
 import sqlite3
 import sys
 import threading
@@ -41,9 +46,12 @@ log = logging.getLogger(__name__)
 _PRIVATE_TASK_FIELDS = frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at"})
 
 
-def _resolve_board(board: Optional[str]) -> str:
+def _resolve_board(board: Optional[str]) -> Optional[str]:
+    """Same contract as core ``_resolve_board``: ``None`` when omitted, so
+    ``kanban_db_path(None)`` applies the ``HERMES_KANBAN_DB`` pin and fence rules;
+    an explicit slug outranks the pin exactly where core lets it."""
     if board is None or board == "":
-        return kanban_db.get_current_board()
+        return None
     try:
         normalized = kanban_db._normalize_board_slug(board)
     except ValueError as exc:
@@ -52,9 +60,11 @@ def _resolve_board(board: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail="board slug is required")
     if normalized != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normalized):
         raise HTTPException(status_code=404, detail=f"board {normalized!r} does not exist")
-    if os.environ.get("HERMES_KANBAN_DB", "").strip() and normalized != kanban_db.get_current_board():
-        raise HTTPException(status_code=409, detail="Kanban database is pinned to the current board")
     return normalized
+
+
+def _board_label(slug: Optional[str]) -> str:
+    return slug or kanban_db.get_current_board()
 
 
 # --- strict read-only SQLite -------------------------------------------------
@@ -90,27 +100,6 @@ def _connection(path: Path):
     return conn
 
 
-def _write_connection(path: Path):
-    """Raw read-write connection used only for comments (``kanban_db.add_comment``)."""
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
-    conn = sqlite3.connect(
-        f"{path.resolve().as_uri()}?mode=rw",
-        uri=True,
-        timeout=5.0,
-        isolation_level=None,
-    )
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=2000")
-        conn.execute("PRAGMA trusted_schema=OFF")
-    except Exception:
-        conn.close()
-        raise
-    return conn
-
-
 def _public_task(task) -> dict[str, Any]:
     item = asdict(task)
     for key in _PRIVATE_TASK_FIELDS:
@@ -125,6 +114,26 @@ def _task_payload(conn, task_id: str):
     item = _public_task(task)
     item["latest_summary"] = kanban_db.latest_summaries(conn, [task_id]).get(task_id)
     return item
+
+
+# Heartbeats are one event per worker tick: noise for a human and unbounded growth
+# for the drawer poll. Keep only the newest meaningful events.
+EVENT_LIMIT = 50
+
+
+def _recent_events(conn, task_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND kind != 'heartbeat' ORDER BY id DESC LIMIT ?",
+        (task_id, EVENT_LIMIT),
+    ).fetchall()
+    return [asdict(kanban_db.Event.from_row(row)) for row in reversed(rows)]
+
+
+def _require_initialized(slug: Optional[str]) -> None:
+    """Writes go through core ``_board_conn``, whose ``init_db`` would create a
+    missing board database; the graph never creates one."""
+    if not kanban_db.kanban_db_path(slug).exists():
+        raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
 
 
 # --- writes delegate to the bundled Kanban dashboard backend ------------------
@@ -232,12 +241,9 @@ def _board_counts(slug: str) -> Optional[dict[str, Any]]:
 @router.get("/boards")
 def boards(counts: bool = Query(True)):
     current = kanban_db.get_current_board()
-    pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     items = []
     for raw in kanban_db.list_boards(include_archived=True):
         slug = raw.get("slug")
-        if pinned and slug != current:
-            continue
         archived = bool(raw.get("archived"))
         item: dict[str, Any] = {
             "slug": slug,
@@ -255,15 +261,26 @@ def boards(counts: bool = Query(True)):
     return {"current": current, "boards": items}
 
 
+@router.get("/workflow")
+def workflow():
+    """Core's manual move matrix, so the status menu offers only moves core accepts."""
+    try:
+        from hermes_cli import kanban_workflow
+    except ImportError as exc:  # pragma: no cover - older hosts
+        raise HTTPException(status_code=503, detail="Kanban workflow is unavailable") from exc
+    return kanban_workflow.DEFAULT_WORKFLOW.to_dict()
+
+
 @router.get("/graph")
 def graph(
     board: Optional[str] = Query(None),
     include_archived: bool = Query(False),
 ):
     slug = _resolve_board(board)
+    label = _board_label(slug)
     path = kanban_db.kanban_db_path(slug)
     if not path.exists():
-        return empty_graph(slug)
+        return empty_graph(label)
     conn = _connection(path)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=include_archived)
@@ -289,7 +306,7 @@ def graph(
         return serialize_graph(
             serialized_tasks,
             edge_rows,
-            board_slug=slug,
+            board_slug=label,
             latest_event_id=int(latest_event_id),
             known_ids=known_ids,
             archived_count=int(archived_count),
@@ -324,7 +341,7 @@ def task_detail(task_id: str, board: Optional[str] = Query(None)):
         return {
             "task": task,
             "comments": [asdict(comment) for comment in kanban_db.list_comments(conn, task_id)],
-            "events": [asdict(event) for event in kanban_db.list_events(conn, task_id)],
+            "events": _recent_events(conn, task_id),
             "links": links,
         }
     finally:
@@ -351,13 +368,15 @@ def update_task_content(
         raise HTTPException(status_code=400, detail="title cannot be empty")
 
     slug = _resolve_board(board)
-    if not kanban_db.kanban_db_path(slug).exists():
-        raise HTTPException(status_code=404, detail="Kanban database is not initialized for this board")
+    _require_initialized(slug)
     core = _core_dashboard()
     with core._board_conn(slug) as (resolved, conn):
-        core._require_task(conn, task_id)
+        task = core._require_task(conn, task_id)
         if payload.status is not None:
-            change = core.UpdateTaskBody(status=payload.status, summary=summary or None)
+            # complete_task writes ``result`` unconditionally; carry the stored one
+            # so completing a reopened card does not erase it.
+            result = getattr(task, "result", None) if payload.status == "done" else None
+            change = core.UpdateTaskBody(status=payload.status, summary=summary or None, result=result)
             try:
                 core._patch_status(conn, task_id, change, False)
             except ValueError as exc:  # e.g. EmptyCompletionError outside the core mapping
@@ -377,15 +396,26 @@ def create_comment(
     if not body:
         raise HTTPException(status_code=400, detail="body is required")
     slug = _resolve_board(board)
-    path = kanban_db.kanban_db_path(slug)
-    conn = _write_connection(path)
-    try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    _require_initialized(slug)
+    core = _core_dashboard()
+    with core._board_conn(slug) as (_resolved, conn):
+        core._require_task(conn, task_id)
         try:
             comment_id = kanban_db.add_comment(conn, task_id, author="desktop", body=body)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "id": comment_id}
-    finally:
-        conn.close()
+
+
+@router.post("/dispatch")
+def dispatch(board: Optional[str] = Query(None)):
+    """Nudge the dispatcher after an edit, like core's ``nudged()`` wrapper, so a
+    card moved to Ready does not wait out the dispatcher tick. Every argument is
+    passed explicitly: core's defaults are FastAPI ``Query`` objects."""
+    slug = _resolve_board(board)
+    _require_initialized(slug)
+    core = _core_dashboard()
+    handler = getattr(core, "dispatch", None)
+    if handler is None:
+        raise HTTPException(status_code=503, detail="The Kanban backend has no dispatch route")
+    return handler(dry_run=False, max_n=8, board=slug)

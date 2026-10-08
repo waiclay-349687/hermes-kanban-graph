@@ -174,7 +174,7 @@ def test_boards_endpoint_returns_available_boards(monkeypatch):
     assert 'default_workdir' not in payload['boards'][1]
 
 
-def test_blank_board_is_resolved_once_and_used_for_path_and_metadata(monkeypatch):
+def test_blank_board_resolves_path_like_core_and_labels_the_current_board(monkeypatch):
     fake = FakeKanban()
     fake.current_board = 'work'
     monkeypatch.setattr(plugin_api, 'kanban_db', fake)
@@ -183,19 +183,23 @@ def test_blank_board_is_resolved_once_and_used_for_path_and_metadata(monkeypatch
     payload = plugin_api.graph(board='', include_archived=False)
 
     assert payload['board']['slug'] == 'work'
-    assert fake.path_calls == ['work']
+    # ``None`` (not the current slug) reaches kanban_db_path, so a HERMES_KANBAN_DB
+    # pin applies exactly as it does for core's omitted ``board``.
+    assert fake.path_calls == [None]
 
 
-def test_pinned_database_only_exposes_and_accepts_current_board(monkeypatch):
-    fake = FakeKanban()
-    fake.current_board = 'work'
-    monkeypatch.setattr(plugin_api, 'kanban_db', fake)
-    monkeypatch.setenv('HERMES_KANBAN_DB', '/tmp/work.db')
+def test_pinned_database_defers_to_core_path_rules(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'home'))
+    monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
+    pinned = tmp_path / 'pinned.db'
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(pinned))
+    plugin_api.kanban_db.create_board('work', name='Work')
 
-    assert [item['slug'] for item in plugin_api.boards()['boards']] == ['work']
-    with pytest.raises(HTTPException) as mismatch:
-        plugin_api.graph(board='default', include_archived=False)
-    assert mismatch.value.status_code == 409
+    listed = [item['slug'] for item in plugin_api.boards(counts=False)['boards']]
+    assert {'default', 'work'} <= set(listed)
+    # No plugin-specific 409: an explicit board is answered like core answers it.
+    assert plugin_api.graph(board='work', include_archived=False)['board']['slug'] == 'work'
+    assert plugin_api.kanban_db.kanban_db_path(None) == pinned
 
 
 def test_connection_opens_sqlite_database_in_read_only_mode(monkeypatch, tmp_path):
@@ -492,3 +496,100 @@ def test_boards_report_counts_and_skip_archived_boards(monkeypatch, tmp_path):
     graph = plugin_api.graph(board='work', include_archived=False)
     assert [node['title'] for node in graph['nodes']] == ['一个任务']
     assert graph['archived_count'] == 1
+
+
+def test_workflow_route_serves_the_core_manual_matrix():
+    from hermes_cli import kanban_workflow
+
+    payload = plugin_api.workflow()
+    assert payload == kanban_workflow.DEFAULT_WORKFLOW.to_dict()
+    assert 'done' not in payload['manual']['todo']
+    assert 'blocked' not in payload['manual']['done']
+
+
+def test_dispatch_nudge_delegates_to_core_with_explicit_arguments(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    calls = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.append(kwargs)
+        return {'spawned': []}
+
+    # Never run the real dispatcher in tests: it would spawn workers.
+    monkeypatch.setattr(core.kbd, 'dispatch_once', fake_dispatch_once)
+    plugin_api.dispatch(board='default')
+    assert calls == [{'dry_run': False, 'max_spawn': 8, 'board': 'default'}]
+
+
+def test_dispatch_nudge_never_creates_a_board_database(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    with pytest.raises(HTTPException) as error:
+        plugin_api.dispatch(board='default')
+    assert error.value.status_code == 404
+    assert not (tmp_path / 'kanban.db').exists()
+
+
+def test_comment_on_uninitialized_board_is_refused_without_creating_it(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    with pytest.raises(HTTPException) as error:
+        plugin_api.create_comment('t_missing', plugin_api.CommentCreate(body='hi'), board='default')
+    assert error.value.status_code == 404
+    assert not (tmp_path / 'kanban.db').exists()
+
+
+def test_comments_use_the_core_write_path(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    opened = []
+    original = core._board_conn
+
+    def spy(board):
+        opened.append(board)
+        return original(board)
+
+    monkeypatch.setattr(core, '_board_conn', spy)
+    plugin_api.create_comment(editable_task, plugin_api.CommentCreate(body='via core'), board='default')
+    assert opened == ['default']
+    assert not hasattr(plugin_api, '_write_connection')
+
+
+def test_completing_a_reopened_task_keeps_its_stored_result(editable_task):
+    plugin_api.update_task_content(editable_task, plugin_api.TaskContentPatch(status='ready'), board='default')
+    conn = _connect('default')
+    try:
+        assert plugin_api.kanban_db.complete_task(conn, editable_task, result='Original result')
+    finally:
+        conn.close()
+    plugin_api.update_task_content(editable_task, plugin_api.TaskContentPatch(status='ready'), board='default')
+    assert plugin_api.task_detail(editable_task, board='default')['task']['result'] == 'Original result'
+
+    done = plugin_api.update_task_content(editable_task, plugin_api.TaskContentPatch(status='done'), board='default')
+    assert done['task']['status'] == 'done'
+    assert done['task']['result'] == 'Original result'
+
+
+def test_detail_events_skip_heartbeats_and_keep_the_newest(editable_task):
+    conn = _connect('default')
+    try:
+        with plugin_api.kanban_db.write_txn(conn):
+            for index in range(plugin_api.EVENT_LIMIT + 10):
+                plugin_api.kanban_db._append_event(conn, editable_task, 'heartbeat', None)
+                plugin_api.kanban_db._append_event(conn, editable_task, 'note', {'n': index})
+    finally:
+        conn.close()
+
+    events = plugin_api.task_detail(editable_task, board='default')['events']
+    assert len(events) == plugin_api.EVENT_LIMIT
+    assert all(event['kind'] != 'heartbeat' for event in events)
+    assert events[-1]['payload'] == {'n': plugin_api.EVENT_LIMIT + 9}
+    assert [event['id'] for event in events] == sorted(event['id'] for event in events)
+
+
+def test_route_surface_includes_workflow_and_dispatch():
+    routes = {
+        (getattr(route, 'path', ''), frozenset(getattr(route, 'methods', set()) or set()))
+        for route in plugin_api.router.routes
+    }
+    assert ('/workflow', frozenset({'GET'})) in routes
+    assert ('/dispatch', frozenset({'POST'})) in routes
