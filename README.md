@@ -41,7 +41,7 @@ The two plugins are unrelated codebases, but **both use the plugin id `kanban-gr
 - Toggling **Show archived** keeps the canvas, zoom and pan, with a small updating indicator
 - Hermes light/dark theme support
 - Read-only graph/detail SQLite queries (`mode=ro` + `query_only` + a deny-all-writes authorizer); edits are delegated to the bundled Kanban backend
-- 10-second graph refresh, 30-second open-task refresh; the refresh button also reloads the open task
+- Live updates: a WebSocket (`/events`, handed to the bundled Kanban backend's event stream with its own auth) refreshes the graph, and the open task when an event touched it, moments after a change; polling stays as a fallback at 60 seconds while the push is live and 10 seconds without it (OAuth remotes, older hosts), plus a 30-second open-task refresh; the refresh button also reloads the open task
 
 ## Development
 
