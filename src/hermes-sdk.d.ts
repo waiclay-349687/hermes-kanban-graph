@@ -112,6 +112,10 @@ declare module '@hermes/plugin-sdk' {
     register(contribution: Record<string, unknown>): () => void
     registerMany(contributions: Record<string, unknown>[]): () => void
     onDispose(dispose: () => void): void
+    /** WebSocket to this plugin's own namespace (`/events`): JSON frames to
+     *  `onMessage`, auto-reconnect with backoff, disposer returned. A no-op on
+     *  OAuth remotes. Newer hosts only. */
+    socket?: (path: string, onMessage: (data: unknown) => void) => () => void
     storage: PluginStorage
     i18n: PluginI18n
   }

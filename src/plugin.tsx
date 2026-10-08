@@ -76,6 +76,7 @@ import {
   type TaskDetail
 } from './graph'
 import { LOCALES } from './i18n'
+import { coalesce, EventCursors, eventsPath, frameEffect, graphPollMs, LIVE_COALESCE_MS, touchesTask, type FrameEffect } from './live'
 import pluginCss from './plugin.css'
 import {
   BoardSwitcher,
@@ -105,11 +106,13 @@ interface WorkflowResponse {
 let api: null | PluginContext['rest'] = null
 let pluginStorage: null | PluginContext['storage'] = null
 let translate: null | PluginContext['i18n']['t'] = null
+// `ctx.socket` (newer hosts only): the live twin of `ctx.rest`. Null means the
+// graph stays on its 10 s polling.
+let openSocket: null | NonNullable<PluginContext['socket']> = null
 const CACHE_SCHEMA_VERSION = 3
 const LOCAL_SCOPE = 'local'
 const DEFAULT_VIEW_SETTINGS: ViewSettings = { direction: 'LR', edgeStyle: 'elbow', hideImplied: false, showGrid: true, showMiniMap: true, showMotion: true }
 const GRAPH_ROUTE = '/kanban-graph'
-const GRAPH_POLL_MS = 10_000
 // Like core's drawer: the open task changes rarely and every edit refetches it.
 const DETAIL_POLL_MS = 30_000
 const KANBAN_FOLLOW_POLL_MS = 2_000
@@ -367,6 +370,65 @@ function PageHeaderControl({ children }: { children: ReactNode }) {
     : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{marked}</Contribute>
 }
 
+// ── live events ──────────────────────────────────────────────────────────────
+//
+// One `/events?board=` socket per (connection scope, board) while the graph is
+// mounted; our backend hands it to core Kanban's event stream. Frames trigger a
+// coalesced refetch of the graph (and of the open task when an event touched
+// it). Polling stays as the fallback: 10 s until a socket frame arrives, 60 s
+// after. The host socket hides close events, so a dropped socket keeps the 60 s
+// poll until it reconnects (it resends the hello) or the board/scope changes.
+
+const eventCursors = new EventCursors()
+const liveSockets = new Set<() => void>()
+// Bumped on plugin dispose: frames from a socket opened before it are dropped.
+let liveGeneration = 0
+
+function closeLiveSockets(): void {
+  liveGeneration += 1
+  for (const close of [...liveSockets]) close()
+  liveSockets.clear()
+  eventCursors.clear()
+}
+
+/** Opens the board's event socket once the board's database exists and
+ *  returns whether a frame (the hello or an event) arrived on it. */
+function useLiveEvents(scope: string, board: string, enabled: boolean, onFrame: (effect: FrameEffect) => void): boolean {
+  const key = enabled && board ? `${scope}\u0000${board}` : ''
+  const [liveKey, setLiveKey] = useState('')
+  const onFrameRef = useRef(onFrame)
+  useEffect(() => {
+    onFrameRef.current = onFrame
+  }, [onFrame])
+  useEffect(() => {
+    const dial = openSocket
+    if (!key || !dial) return
+    // The host dials whatever connection is routed now: never bind a socket to
+    // an outgoing scope's key (the effect reruns once the scope publishes).
+    const routed = routedScope()
+    if (routed !== null && routed !== scope) return
+    const generation = liveGeneration
+    let current = true
+    const close = dial(eventsPath(board, eventCursors.get(scope, board)), data => {
+      const routedNow = routedScope()
+      if (!current || generation !== liveGeneration || (routedNow !== null && routedNow !== scope)) return
+      const effect = frameEffect(data)
+      if (!effect.live) return
+      eventCursors.note(scope, board, effect.cursor)
+      setLiveKey(key)
+      onFrameRef.current(effect)
+    })
+    liveSockets.add(close)
+    return () => {
+      current = false
+      if (liveSockets.delete(close)) close()
+      // A reopened socket for the same board must earn "live" again.
+      setLiveKey(previous => (previous === key ? '' : previous))
+    }
+  }, [board, key, scope])
+  return Boolean(key) && liveKey === key
+}
+
 function TaskInspectorController({
   board,
   children,
@@ -527,6 +589,8 @@ function GraphPage() {
   const restoreFocusRef = useRef<HTMLElement | null>(null)
   const restoreNodeIdRef = useRef<string | null>(null)
   const detailRefetchRef = useRef<null | (() => Promise<unknown>)>(null)
+  const graphRefetchRef = useRef<null | (() => Promise<unknown>)>(null)
+  const selectedIdRef = useRef<string | null>(null)
   const refetchedForSlugRef = useRef('')
   // Search runs on every card; let typing stay responsive on large boards.
   const deferredQuery = useDeferredValue(filters.query)
@@ -565,9 +629,28 @@ function GraphPage() {
     selection,
     serverCurrent: boardsQuery.data?.current ?? ''
   })
+  const [liveBoard, setLiveBoard] = useState({ key: '', initialized: false })
+  const liveFrames = useMemo(() => {
+    const graph = coalesce(() => void graphRefetchRef.current?.(), LIVE_COALESCE_MS)
+    const detail = coalesce(() => void detailRefetchRef.current?.(), LIVE_COALESCE_MS)
+    return {
+      cancel: () => { graph.cancel(); detail.cancel() },
+      onFrame: (effect: FrameEffect) => {
+        if (effect.refreshGraph) graph.schedule()
+        if (touchesTask(effect, selectedIdRef.current)) detail.schedule()
+      }
+    }
+  }, [])
+  useEffect(() => liveFrames.cancel, [liveFrames])
+  const live = useLiveEvents(scope, boardValue, liveBoard.key === `${scope}\u0000${boardValue}` && liveBoard.initialized, liveFrames.onFrame)
   const graphQuery = useQuery<GraphPayload>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'graph', boardValue, includeArchived],
-    queryFn: () => scopedGet<GraphPayload>(scope, `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`),
+    queryFn: () => scopedGet<GraphPayload>(scope, `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`).then(graph => {
+      // The snapshot's event tail (before `select` strips it): a socket opened
+      // later resumes from here instead of the server's tail.
+      if (graph.board.initialized) eventCursors.note(scope, graph.board.slug, graph.board.latest_event_id)
+      return graph
+    }),
     enabled: query => Boolean(boardValue) && routedToScope(query),
     // Same board, other archive filter: keep the canvas (and its zoom) while loading.
     // Only for the same connection: two gateways can both have a `default` board.
@@ -576,7 +659,7 @@ function GraphPage() {
     // The event cursor moves on every worker heartbeat; without it an unchanged
     // board keeps its identity and nothing downstream recomputes.
     select: stripEventCursor,
-    refetchInterval: GRAPH_POLL_MS
+    refetchInterval: graphPollMs(live)
   })
   const positionContext = boardValue
     ? (scope === LOCAL_SCOPE ? `${boardValue}:${settings.direction}` : `${scope}:${boardValue}:${settings.direction}`)
@@ -585,6 +668,20 @@ function GraphPage() {
   const positionOverrides = positionContext ? positionStore[positionContext]?.positions ?? EMPTY_POSITIONS : EMPTY_POSITIONS
 
   const payload = boardValue && graphQuery.data?.board.slug === boardValue ? graphQuery.data : undefined
+  const refetchGraph = graphQuery.refetch
+  useEffect(() => {
+    graphRefetchRef.current = refetchGraph
+  }, [refetchGraph])
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+  }, [selectedId])
+  // Open the socket only for a board whose database exists (the backend
+  // refuses others) and only once its snapshot set the resume cursor.
+  const payloadInitialized = Boolean(payload?.board.initialized) && !graphQuery.isPlaceholderData
+  useEffect(() => {
+    if (!payload || graphQuery.isPlaceholderData) return
+    setLiveBoard({ key: `${scope}\u0000${boardValue}`, initialized: payloadInitialized })
+  }, [boardValue, graphQuery.isPlaceholderData, payload, payloadInitialized, scope])
   const refreshing = Boolean(payload) && graphQuery.isPlaceholderData
   const searchFilters = useMemo(() => ({ ...filters, query: deferredQuery }), [deferredQuery, filters])
   const selected = useMemo(() => payload?.nodes.find(task => task.id === selectedId) ?? null, [payload, selectedId])
@@ -1001,6 +1098,7 @@ export default {
   defaultEnabled: true,
   register(ctx: PluginContext) {
     api = ctx.rest.bind(ctx)
+    openSocket = typeof ctx.socket === 'function' ? ctx.socket.bind(ctx) : null
     pluginStorage = ctx.storage
     const disposeI18n = ctx.i18n?.register ? ctx.i18n.register(LOCALES) : () => {}
     translate = ctx.i18n?.t ?? null
@@ -1008,6 +1106,8 @@ export default {
     const disposeSidebarToggle = installSidebarToggle(navLabel)
     const disposeApi = () => {
       cancelNudges()
+      closeLiveSockets()
+      openSocket = null
       api = null
       pluginStorage = null
       translate = null
