@@ -343,6 +343,36 @@ describe('consistency with the bundled Kanban board', () => {
       value && typeof value === 'object' ? keys(value as Record<string, unknown>, `${prefix}${key}.`) : [`${prefix}${key}`])
     expect(keys(LOCALES.zh as Record<string, unknown>).sort()).toEqual(keys(LOCALES.en as Record<string, unknown>).sort())
   })
+
+  const coreSwitcher = join(homedir(), '.hermes/hermes-agent/apps/desktop/src/plugins/kanban/board-switcher.tsx')
+  const coreI18n = join(homedir(), '.hermes/hermes-agent/apps/desktop/src/plugins/kanban/i18n.ts')
+
+  it.skipIf(!existsSync(coreSwitcher))('renders the board switcher with core Kanban\'s tab classes', () => {
+    const core = readFileSync(coreSwitcher, 'utf8')
+    const ours = readFileSync(join(__dirname, '../src/ui.tsx'), 'utf8')
+    for (const cls of [
+      'min-w-0 max-w-full gap-1.5 px-2',
+      'shrink-0 text-(--ui-text-tertiary)',
+      'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-tertiary)',
+      'min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none',
+      'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+      'text-[0.625rem] tabular-nums text-(--ui-text-quaternary)'
+    ]) {
+      expect(core).toContain(cls)
+      expect(ours).toContain(cls)
+    }
+    expect(core).toContain('className="h-full min-w-0 max-w-full gap-1.5 px-2"')
+  })
+
+  it.skipIf(!existsSync(coreI18n))('labels the switcher with core\'s `board` / `switchBoard` strings', () => {
+    const core = readFileSync(coreI18n, 'utf8')
+    const en = LOCALES.en as { board: { board: string; switch: string } }
+    const zh = LOCALES.zh as { board: { board: string; switch: string } }
+    expect(core).toContain(`  board: '${en.board.board}',`)
+    expect(core).toContain(`  switchBoard: '${en.board.switch}',`)
+    expect(core).toContain(`  board: '${zh.board.board}',`)
+    expect(core).toContain(`  switchBoard: '${zh.board.switch}',`)
+  })
 })
 
 describe('implied links', () => {

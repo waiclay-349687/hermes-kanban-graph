@@ -342,7 +342,7 @@ function escapeIsForInnerControl(event: KeyboardEvent): boolean {
 // page. A disk plugin's route registers after the first route resolution, so
 // after a reload on /kanban-graph the header can still show session tabs and
 // the projected switcher is never mounted. Then render it inline instead.
-function PageHeaderControl({ children }: { children: ReactNode }) {
+function PageHeaderControl({ children }: { children: (inline: boolean) => ReactNode }) {
   const HeaderControl = sdk.WorkspacePageHeaderControl
   const [inline, setInline] = useState(false)
   useEffect(() => {
@@ -363,11 +363,13 @@ function PageHeaderControl({ children }: { children: ReactNode }) {
       observer.disconnect()
     }
   }, [HeaderControl, inline])
-  const marked = <span className="hkg-board-switcher-host" data-hkg-board-switcher="">{children}</span>
-  if (inline) return marked
+  // Projected into the page header the switcher fills the tab height like
+  // core's; anywhere else (inline, or the old titlebar slot) it is `h-7`.
+  const marked = (compact: boolean) => <span className="hkg-board-switcher-host" data-hkg-board-switcher="">{children(compact)}</span>
+  if (inline) return marked(true)
   return HeaderControl
-    ? <HeaderControl id="kanban-graph:board-switcher">{marked}</HeaderControl>
-    : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{marked}</Contribute>
+    ? <HeaderControl id="kanban-graph:board-switcher">{marked(false)}</HeaderControl>
+    : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{marked(true)}</Contribute>
 }
 
 // ── live events ──────────────────────────────────────────────────────────────
@@ -1008,7 +1010,7 @@ function GraphPage() {
       <header className="hkg-toolbar">
         <h1>{t('title')}</h1>
         <PageHeaderControl>
-          <BoardSwitcher boards={availableBoards} followedSlug={followedSlug} onChange={chooseBoard} selection={selection} />
+          {inline => <BoardSwitcher boards={availableBoards} followedSlug={followedSlug} inline={inline} onChange={chooseBoard} selection={selection} />}
         </PageHeaderControl>
         <span className="hkg-count">{filtered?.nodes.length ?? payload?.nodes.length ?? 0}</span>
         <FilterMenu assignees={assignees} filters={filters} includeArchived={includeArchived} onArchived={setIncludeArchived} onChange={patchFilters} tenants={tenants} />

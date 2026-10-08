@@ -32,6 +32,9 @@ const en = {
   },
   board: {
     label: 'Kanban board',
+    // Core Kanban's `k.board` / `k.switchBoard` (apps/desktop/src/plugins/kanban/i18n.ts).
+    board: 'Board',
+    switch: 'Switch board',
     follow: 'Follow Kanban',
     followHint: (name: string) => `Same board as the Kanban page (${name})`,
     boards: 'Boards',
@@ -175,6 +178,8 @@ const zh: Messages = {
   },
   board: {
     label: '看板',
+    board: '面板',
+    switch: '切换面板',
     follow: '跟随看板页面',
     followHint: name => `与看板页面相同（${name}）`,
     boards: '看板列表',

@@ -16,11 +16,6 @@ import {
   profileColor,
   profileColorSoft,
   SegmentedControl,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Switch,
   Textarea,
   Tip,
@@ -416,39 +411,66 @@ export function GraphSettings({ hasManualPositions, onChange, onFit, onResetPosi
 
 const boardLabel = (board: BoardMeta | undefined, fallback: string) => board?.name || board?.slug || fallback
 
-export function BoardSwitcher({ boards, followedSlug, onChange, selection }: {
+/**
+ * Same markup and classes as core Kanban's switcher
+ * (apps/desktop/src/plugins/kanban/board-switcher.tsx): a flat ghost tab that
+ * fills the workspace page-header slot. `inline` (our own toolbar, when the
+ * page header is not painted) only swaps `h-full` for `h-7`.
+ */
+export function BoardSwitcher({ boards, followedSlug, inline = false, onChange, selection }: {
   boards: BoardMeta[]
   followedSlug: string
+  inline?: boolean
   onChange: (selection: string) => void
   selection: string
 }) {
   const t = useT()
   if (boards.length === 0) return null
   const followed = boards.find(board => board.slug === followedSlug)
-  const value = selection === FOLLOW_KANBAN || !boards.some(board => board.slug === selection) ? FOLLOW_KANBAN : selection
+  const following = selection === FOLLOW_KANBAN || !boards.some(board => board.slug === selection)
+  const active = following ? followed : boards.find(board => board.slug === selection)
+  const label = boardLabel(active, following ? followedSlug || t('board.board') : selection)
+  const count = active?.total
   return (
-    <Select onValueChange={onChange} value={value}>
-      <SelectTrigger aria-label={t('board.label')} className="hkg-board-switcher" size="xs">
-        <Codicon name={value === FOLLOW_KANBAN ? 'link' : 'project'} size="0.75rem" />
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        <SelectItem value={FOLLOW_KANBAN}>
-          <span className="hkg-board-option">
-            <span className="hkg-board-option-name">{t('board.follow')} · {boardLabel(followed, followedSlug)}</span>
-            {typeof followed?.total === 'number' && <span className="hkg-board-option-count">{followed.total}</span>}
-          </span>
-        </SelectItem>
+    <DropdownMenu>
+      <Tip label={following ? t('board.followHint', label) : t('board.switch')}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            aria-label={`${t('board.board')}: ${label}`}
+            className={cn(inline ? 'h-7' : 'h-full', 'min-w-0 max-w-full gap-1.5 px-2')}
+            size="sm"
+            variant="ghost"
+          >
+            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="project" size="0.8125rem" />
+            <span className="shrink-0 text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{t('board.board')}</span>
+            <span className="min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none">{label}</span>
+            {following && <Codicon aria-label={t('board.following')} className="shrink-0 text-(--ui-text-quaternary)" name="link" size="0.6875rem" />}
+            {typeof count === 'number' && (
+              <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{count}</span>
+            )}
+            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
+          </Button>
+        </DropdownMenuTrigger>
+      </Tip>
+      <DropdownMenuContent align="center">
+        <DropdownMenuItem onSelect={() => onChange(FOLLOW_KANBAN)}>
+          <Codicon name="link" size="0.8rem" />
+          {t('board.follow')}
+          <span className="text-[0.625rem] text-(--ui-text-quaternary)">{boardLabel(followed, followedSlug)}</span>
+          {following && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         {boards.map(board => (
-          <SelectItem key={board.slug} value={board.slug}>
-            <span className="hkg-board-option">
-              <span className="hkg-board-option-name">{boardLabel(board, board.slug)}</span>
-              {typeof board.total === 'number' && <span className="hkg-board-option-count">{board.total}</span>}
-            </span>
-          </SelectItem>
+          <DropdownMenuItem key={board.slug} onSelect={() => onChange(board.slug)}>
+            {boardLabel(board, board.slug)}
+            {typeof board.total === 'number' && (
+              <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{board.total}</span>
+            )}
+            {!following && board.slug === selection && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+          </DropdownMenuItem>
         ))}
-      </SelectContent>
-    </Select>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

@@ -40,7 +40,6 @@
 .hkg-control-active { color: var(--ui-text-primary) !important; background: var(--ui-control-active-background) !important; }
 .hkg-stat { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-tertiary); font-size: 10px; white-space: nowrap; }
 .hkg-stat > span { color: var(--ui-text-quaternary); }
-.hkg-board-switcher { width: min(220px, 28vw); justify-content: center !important; }
 .hkg-refreshing { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-tertiary); font-size: 10px; white-space: nowrap; }
 .hkg-state-note { max-width: 360px; margin: 0; text-align: center; font-size: 11px; }
 
@@ -282,7 +281,6 @@
 @media (max-width: 760px) {
   .hkg-search { width: 170px; }
   .hkg-stat { display: none; }
-  .hkg-board-switcher { width: 170px; }
 }
 
 @media (max-width: 520px) {
@@ -317,9 +315,6 @@
 .hkg-archived-hint { display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 4px; padding: 2px 6px; color: var(--ui-text-quaternary); background: transparent; font: inherit; font-size: 10px; cursor: pointer; white-space: nowrap; }
 .hkg-archived-hint:hover { color: var(--ui-text-secondary); background: var(--ui-control-hover-background); }
 .hkg-banner { flex: none; display: flex; align-items: center; gap: 6px; margin: 0 16px 6px; border-radius: 6px; padding: 5px 9px; color: var(--ui-text-secondary); background: color-mix(in srgb, #fbbf24 12%, transparent); font-size: 11px; }
-.hkg-board-option { min-width: 0; display: inline-flex; align-items: center; gap: 8px; }
-.hkg-board-option-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hkg-board-option-count { margin-left: auto; color: var(--ui-text-quaternary); font-size: 10px; font-variant-numeric: tabular-nums; }
 .hkg-complete-form { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; border: 1px solid var(--ui-stroke-tertiary); border-radius: 6px; padding: 8px 10px 10px; }
 .hkg-complete-form textarea { min-height: 70px; resize: vertical; font-size: 11px; line-height: 16px; }
 .hkg-hidden-note { display: flex; align-items: center; gap: 5px; margin-top: 8px; }
