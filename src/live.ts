@@ -122,13 +122,25 @@ export class EventCursors {
    *  board's database was replaced (restore, recreated board): event ids
    *  restarted. Rewind to the snapshot and forget processed ids. Returns
    *  whether it rewound (the caller then reopens the socket). */
-  rewindIfBehind(scope: string, board: string, tail: number): boolean {
+  rewindIfBehind(scope: string, board: string, tail: number, baseline?: number): boolean {
     const key = EventCursors.key(scope, board)
     const seen = this.cursors.get(key)
-    if (seen === undefined || tail >= seen) return false
+    // Compare with the cursor from when the snapshot request started (if
+    // given): events streamed in during the request must not look like a
+    // restore.
+    const reference = baseline ?? seen
+    if (seen === undefined || reference === undefined || tail >= reference) return false
     this.cursors.set(key, tail)
     this.done.delete(key)
     return true
+  }
+
+  /** Cursor per board for one scope, frozen at call time. */
+  snapshot(scope: string): Map<string, number> {
+    const prefix = `${scope}\u0000`
+    const out = new Map<string, number>()
+    for (const [key, cursor] of this.cursors) if (key.startsWith(prefix)) out.set(key.slice(prefix.length), cursor)
+    return out
   }
 
   clear(): void {

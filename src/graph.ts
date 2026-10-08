@@ -170,6 +170,8 @@ export interface GraphPayload {
   edges: GraphLink[]
   archived_count?: number
   truncated?: boolean
+  /** All-boards view: some board could not be read (totals are a lower bound). */
+  incomplete?: boolean
   /** Tasks the server matched before applying its node cap. */
   total_count?: number
   /** All-boards view only: every open board, initialized or not. */
@@ -688,7 +690,12 @@ export function layoutBoards(
       connectable: false
     } as BandNode)
     for (const node of result.nodes) {
-      nodes.push({ ...node, id: nodeKey(slice.board, node.id), position: { x: node.position.x + dx, y: node.position.y + dy } } as GraphNode)
+      nodes.push({
+        ...node,
+        id: nodeKey(slice.board, node.id),
+        position: { x: node.position.x + dx, y: node.position.y + dy },
+        ...(node.type === 'task' ? { data: { ...node.data, board: slice.board } } : {})
+      } as GraphNode)
     }
     for (const edge of result.edges) {
       edges.push({ ...edge, id: nodeKey(slice.board, edge.id), source: nodeKey(slice.board, edge.source), target: nodeKey(slice.board, edge.target) })
@@ -713,11 +720,62 @@ function validPosition(position: XYPosition | undefined): position is XYPosition
  * Entries without `linked` (saved before 0.3) are treated as linked.
  */
 export function applyPositionOverrides<T extends GraphNode>(nodes: T[], overrides: PositionOverrides): T[] {
-  return nodes.map(node => {
+  // All-boards view: positions are stored relative to the card's band origin,
+  // so a band that moves (board order, a board above growing, filters) carries
+  // its manually placed cards along instead of dropping them into another band.
+  const origins = bandOrigins(nodes)
+  const placed = nodes.map(node => {
     if (node.type !== 'task') return node
     const saved = overrides[node.id]
     if (!validPosition(saved) || (saved.linked ?? true) !== Boolean(node.data._linked)) return node
-    return { ...node, position: { x: saved.x, y: saved.y } }
+    const origin = taskBandOrigin(node, origins)
+    return { ...node, position: { x: saved.x + origin.x, y: saved.y + origin.y } }
+  })
+  return origins.size ? fitBands(placed) : placed
+}
+
+function bandOrigins(nodes: readonly GraphNode[]): Map<string, XYPosition> {
+  const origins = new Map<string, XYPosition>()
+  for (const node of nodes) if (node.type === 'band') origins.set(String((node.data as { board?: unknown }).board), node.position)
+  return origins
+}
+
+function taskBandOrigin(node: GraphNode, origins: Map<string, XYPosition>): XYPosition {
+  const board = (node.data as { board?: unknown }).board
+  return (typeof board === 'string' && origins.get(board)) || { x: 0, y: 0 }
+}
+
+/** Position to persist for a dragged card: band-relative in the all-boards view. */
+export function storedPosition(node: GraphNode, layoutNodes: readonly GraphNode[]): XYPosition {
+  const origin = taskBandOrigin(node, bandOrigins(layoutNodes))
+  return { x: node.position.x - origin.x, y: node.position.y - origin.y }
+}
+
+/** Grows each band so manually moved cards stay inside it. */
+function fitBands<T extends GraphNode>(nodes: T[]): T[] {
+  const bounds = new Map<string, { minX: number; minY: number; maxX: number; maxY: number }>()
+  for (const node of nodes) {
+    if (node.type !== 'task') continue
+    const board = (node.data as { board?: unknown }).board
+    if (typeof board !== 'string') continue
+    const b = bounds.get(board) ?? { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }
+    b.minX = Math.min(b.minX, node.position.x)
+    b.minY = Math.min(b.minY, node.position.y)
+    b.maxX = Math.max(b.maxX, node.position.x + (node.width ?? NODE_WIDTH))
+    b.maxY = Math.max(b.maxY, node.position.y + (node.height ?? NODE_HEIGHT))
+    bounds.set(board, b)
+  }
+  return nodes.map(node => {
+    if (node.type !== 'band') return node
+    const data = node.data as { board: string; width: number; height: number }
+    const b = bounds.get(data.board)
+    if (!b) return node
+    const x = Math.min(node.position.x, b.minX - BAND_PAD)
+    const y = Math.min(node.position.y, b.minY - BAND_HEADER - BAND_PAD)
+    const width = Math.max(node.position.x + data.width, b.maxX + BAND_PAD) - x
+    const height = Math.max(node.position.y + data.height, b.maxY + BAND_PAD) - y
+    if (x === node.position.x && y === node.position.y && width === data.width && height === data.height) return node
+    return { ...node, position: { x, y }, width, height, data: { ...data, width, height } }
   })
 }
 

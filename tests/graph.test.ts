@@ -573,3 +573,23 @@ describe('connection scope gate', () => {
     expect(keyInRoutedScope(key, null)).toBe(true)
   })
 })
+
+describe('all-boards saved positions are band-relative', () => {
+  it('a band that moves carries its manually placed cards along', async () => {
+    const { applyPositionOverrides, storedPosition } = await import('../src/graph')
+    const band = (board: string, y: number) => ({ id: `band:${board}`, type: 'band', position: { x: 40, y }, data: { board, width: 400, height: 200 }, width: 400, height: 200 })
+    const card = (board: string, y: number) => ({ id: `${board}::t`, type: 'task', position: { x: 80, y }, data: { id: 't', board, _linked: false }, width: 220, height: 80 })
+    const before = [band('a', 40), band('b', 300), card('a', 100), card('b', 360)] as never[]
+    const dragged = { ...(before[3] as object), position: { x: 300, y: 420 } } as never
+    const saved = storedPosition(dragged, before)
+    expect(saved).toEqual({ x: 260, y: 120 })
+    // board order swapped: b's band now sits on top
+    const after = [band('b', 40), band('a', 300), card('b', 100), card('a', 360)] as never[]
+    const placed = applyPositionOverrides(after, { 'b::t': { ...saved, linked: false } }) as Array<{ id: string; position: { x: number; y: number }; width?: number; height?: number; data: { width: number; height: number } }>
+    const b = placed.find(node => node.id === 'b::t')!
+    expect(b.position).toEqual({ x: 300, y: 160 })
+    const bandB = placed.find(node => node.id === 'band:b')!
+    expect(b.position.y + 80).toBeLessThanOrEqual(40 + bandB.data.height)
+    expect(b.position.x + 220).toBeLessThanOrEqual(40 + bandB.data.width)
+  })
+})

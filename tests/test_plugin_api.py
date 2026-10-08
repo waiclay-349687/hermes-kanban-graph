@@ -893,3 +893,36 @@ def test_all_boards_sentinel_is_not_a_board_slug(monkeypatch, tmp_path):
 def test_all_boards_route_is_registered_read_only():
     routes = {(getattr(route, 'path', ''), tuple(sorted(getattr(route, 'methods', None) or ()))) for route in plugin_api.router.routes}
     assert ('/graph/all', ('GET',)) in routes
+
+
+def test_all_boards_spent_budget_reads_counts_only(monkeypatch, tmp_path):
+    _all_boards_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin_api, 'MAX_ALL_NODES', 2)
+    reads = []
+    real = plugin_api.kanban_db.list_tasks
+    monkeypatch.setattr(plugin_api.kanban_db, 'list_tasks', lambda conn, **kw: reads.append(1) or real(conn, **kw))
+
+    payload = plugin_api.graph_all(include_archived=False)
+
+    assert len(reads) == 1  # alpha fills the budget; beta is only counted
+    meta = {item['slug']: item for item in payload['boards']}
+    assert meta['beta']['shown'] == 0 and meta['beta']['total'] == 2 and meta['beta']['truncated'] is True
+    assert meta['beta']['latest_event_id'] > 0
+    assert payload['truncated'] is True and payload['total_count'] == 4
+
+
+def test_all_boards_unreadable_board_marks_the_payload_incomplete(monkeypatch, tmp_path):
+    _all_boards_home(monkeypatch, tmp_path)
+    path = plugin_api.kanban_db.kanban_db_path('beta')
+    for suffix in ('-wal', '-shm'):
+        side = path.with_name(path.name + suffix)
+        if side.exists():
+            side.unlink()
+    path.write_bytes(b'not a sqlite database')
+
+    payload = plugin_api.graph_all(include_archived=False)
+
+    meta = {item['slug']: item for item in payload['boards']}
+    assert meta['beta'].get('error') is True
+    assert payload['incomplete'] is True
+    assert all(node['board'] == 'alpha' for node in payload['nodes'])

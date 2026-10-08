@@ -42,6 +42,7 @@ import {
 import {
   ALL_BOARDS,
   applyPositionOverrides,
+  storedPosition,
   boardSelectionStorageKey,
   coreKanbanEnabled,
   decorateGraph,
@@ -723,26 +724,32 @@ function GraphPage() {
   const live = useLiveEvents(scope, liveTarget.key === liveKey ? liveTarget.boards : NO_BOARDS, liveFrames.onFrame)
   const graphQuery = useQuery<GraphPayload>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'graph', boardValue, includeArchived],
-    queryFn: () => scopedGet<GraphPayload>(
+    queryFn: () => {
+      const baseline = eventCursors.snapshot(scope)
+      return scopedGet<GraphPayload>(
       scope,
       boardValue === ALL_BOARDS
         ? `/graph/all?include_archived=${includeArchived}`
         : `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`
     ).then(graph => {
       // The snapshot's event tails (before `select` strips them): a socket
-      // opened later resumes from here instead of the server's tail.
+      // opened later resumes from here instead of the server's tail. A rewind
+      // (replaced database) is judged against the cursors as they were when
+      // the request STARTED: a socket advancing the cursor while the boards
+      // were being read is normal, not a restore.
       const tails = graph.boards
         ? graph.boards.filter(board => board.initialized && !board.error).map(board => [board.slug, board.latest_event_id] as const)
         : graph.board.initialized ? [[graph.board.slug, graph.board.latest_event_id] as const] : []
       for (const [slug, tail] of tails) {
         if (typeof tail !== 'number') continue
-        if (eventCursors.rewindIfBehind(scope, slug, tail)) {
+        if (eventCursors.rewindIfBehind(scope, slug, tail, baseline.get(slug) ?? -1)) {
           socketReopen.dispatchEvent(new CustomEvent('reopen', { detail: `${scope}\u0000${slug}` }))
         }
         eventCursors.note(scope, slug, tail)
       }
       return graph
-    }),
+    })
+    },
     enabled: query => Boolean(boardValue) && routedToScope(query),
     // Same board, other archive filter: keep the canvas (and its zoom) while loading.
     // Only for the same connection: two gateways can both have a `default` board.
@@ -968,9 +975,10 @@ function GraphPage() {
     // full-board position.
     if (filtersActive) return
     if (!positionContext || !isTaskNode(node)) return
+    const at = storedPosition(node, autoElements.nodes)
     writePositionStore(savePosition(positionStoreRef.current, positionContext, node.id, {
-      x: node.position.x,
-      y: node.position.y,
+      x: at.x,
+      y: at.y,
       linked: Boolean(node.data._linked)
     }))
   }
@@ -1044,7 +1052,7 @@ function GraphPage() {
   // Drop saved positions of tasks that are gone. Only a complete payload (no
   // archived tasks held back, nothing truncated) can tell "gone" from "hidden".
   useEffect(() => {
-    if (!payload || !positionContext || refreshing || payload.truncated) return
+    if (!payload || !positionContext || refreshing || payload.truncated || payload.incomplete) return
     if (!includeArchived && (payload.archived_count ?? 0) > 0) return
     writePositionStore(prunePositions(positionStoreRef.current, positionContext, new Set(taskIndex.keys())))
   }, [includeArchived, payload, positionContext, refreshing, taskIndex])
@@ -1129,7 +1137,7 @@ function GraphPage() {
     if (archivedHidden > 0) {
       return <div className="hkg-state"><EmptyState description={t('state.allArchivedHint')} title={t(allMode ? 'state.allArchivedAll' : 'state.allArchived', archivedHidden)} /><Button onClick={() => setIncludeArchived(true)} size="sm" variant="outline">{t('state.showArchived')}</Button></div>
     }
-    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t(allMode ? 'state.emptyAll' : 'state.empty')} />{openKanbanAction}</div>
+    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t(allMode ? (payload?.incomplete ? 'state.boardsUnreadableTitle' : 'state.emptyAll') : 'state.empty')} />{openKanbanAction}</div>
   }
 
   return (
@@ -1160,6 +1168,13 @@ function GraphPage() {
         />
         <RefreshButton onRefresh={refreshAll} refreshing={graphQuery.isFetching} />
       </header>
+      {payload?.incomplete && (
+        <div className="hkg-banner" role="status">
+          <Codicon name="warning" size="0.75rem" />
+          {t('state.boardsUnreadable', (payload.boards ?? []).filter(board => board.error).map(board => board.name || board.slug).join('、'))}
+          <Button onClick={() => void graphQuery.refetch()} size="xs" variant="ghost">{t('state.retry')}</Button>
+        </div>
+      )}
       {payload?.truncated && (
         <div className="hkg-banner"><Codicon name="warning" size="0.75rem" />{t('state.truncated', payload.nodes.length, payload.total_count ?? payload.nodes.length)}</div>
       )}

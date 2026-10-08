@@ -173,3 +173,17 @@ describe('replay, rewind and lease', () => {
     expect(hello).toMatchObject({ live: true, refreshGraph: false, cursor: 7, taskIds: [], untargeted: false })
   })
 })
+
+describe('rewind baseline', () => {
+  it('ignores cursors that advanced during the snapshot request', () => {
+    const cursors = new EventCursors()
+    cursors.note('local', 'a', 20)
+    const baseline = cursors.snapshot('local')
+    cursors.note('local', 'a', 25)
+    cursors.markProcessed('local', 'a', 25)
+    expect(cursors.rewindIfBehind('local', 'a', 20, baseline.get('a') ?? -1)).toBe(false)
+    expect(cursors.processed('local', 'a')).toBe(25)
+    expect(cursors.rewindIfBehind('local', 'a', 3, baseline.get('a') ?? -1)).toBe(true)
+    expect(cursors.rewindIfBehind('local', 'unknown', 0, baseline.get('unknown') ?? -1)).toBe(false)
+  })
+})

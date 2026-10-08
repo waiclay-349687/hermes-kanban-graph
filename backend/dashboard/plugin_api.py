@@ -304,6 +304,7 @@ def graph_all(include_archived: bool = Query(False)):
     archived_count = 0
     total_count = 0
     truncated = False
+    incomplete = False
     for raw in kanban_db.list_boards(include_archived=True):
         if raw.get("archived"):
             continue
@@ -330,10 +331,23 @@ def graph_all(include_archived: bool = Query(False)):
         if not path.exists():
             continue
         try:
+            if remaining <= 0:
+                # Global budget spent: counts and event tail only, no task reads.
+                counts = _read_counts(path, include_archived)
+                entry.update(initialized=True, truncated=counts["total_count"] > 0, **{
+                    "latest_event_id": counts["latest_event_id"],
+                    "total": counts["total_count"],
+                    "archived_count": counts["archived_count"],
+                })
+                archived_count += counts["archived_count"]
+                total_count += counts["total_count"]
+                truncated = truncated or counts["total_count"] > 0
+                continue
             part = _read_graph(path, slug, include_archived, max_nodes=max(0, min(_graph_data.MAX_NODES, remaining)))
         except Exception as exc:  # one unreadable/legacy board must not hide the rest
             log.info("kanban-graph: reading board %s for the all-boards view failed: %s", slug, exc)
             entry["error"] = True
+            incomplete = True
             continue
         shown = len(part["nodes"])
         remaining -= shown
@@ -362,7 +376,25 @@ def graph_all(include_archived: bool = Query(False)):
         "edges": edges,
         "archived_count": archived_count,
         "truncated": truncated,
+        # Some board could not be read: totals are a lower bound and the
+        # client must not treat missing tasks as deleted.
+        "incomplete": incomplete,
         "total_count": total_count,
+    }
+
+
+def _read_counts(path: Path, include_archived: bool) -> dict[str, int]:
+    conn = _connection(path)
+    try:
+        latest = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+        archived = conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE status = 'archived'").fetchone()["n"]
+        everything = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    finally:
+        conn.close()
+    return {
+        "latest_event_id": int(latest),
+        "archived_count": 0 if include_archived else int(archived),
+        "total_count": int(everything if include_archived else everything - archived),
     }
 
 
