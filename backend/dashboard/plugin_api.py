@@ -277,6 +277,96 @@ def graph(
     path = kanban_db.kanban_db_path(slug)
     if not path.exists():
         return empty_graph(label)
+    return _read_graph(path, label, include_archived)
+
+
+# --- all boards ---------------------------------------------------------------
+#
+# One read-only projection per open board, concatenated. Every node and edge is
+# tagged with its ``board``; task ids are only unique within a board, so the UI
+# keys cards by (board, id) and keeps calling the per-board routes with the
+# task's own board. Archived boards and boards whose database was never created
+# are skipped (nothing is opened, nothing is created). The per-board node cap
+# still applies, and a global cap bounds the whole response; ``truncated`` says
+# so honestly, per board and overall.
+
+ALL_BOARDS = "*all*"  # not a valid slug: ``_BOARD_SLUG_RE`` rejects ``*``
+MAX_ALL_NODES = 10_000
+
+
+@router.get("/graph/all")
+def graph_all(include_archived: bool = Query(False)):
+    current = kanban_db.get_current_board()
+    remaining = MAX_ALL_NODES
+    boards_out: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    archived_count = 0
+    total_count = 0
+    truncated = False
+    for raw in kanban_db.list_boards(include_archived=True):
+        if raw.get("archived"):
+            continue
+        try:
+            slug = kanban_db._normalize_board_slug(str(raw.get("slug") or ""))
+        except ValueError:
+            continue
+        if not slug:
+            continue
+        entry: dict[str, Any] = {
+            "slug": slug,
+            "name": raw.get("name") or None,
+            "icon": raw.get("icon") or None,
+            "is_current": slug == current,
+            "initialized": False,
+            "latest_event_id": 0,
+            "total": 0,
+            "shown": 0,
+            "archived_count": 0,
+            "truncated": False,
+        }
+        boards_out.append(entry)
+        path = kanban_db.kanban_db_path(slug)
+        if not path.exists():
+            continue
+        try:
+            part = _read_graph(path, slug, include_archived, max_nodes=max(0, min(_graph_data.MAX_NODES, remaining)))
+        except Exception as exc:  # one unreadable/legacy board must not hide the rest
+            log.info("kanban-graph: reading board %s for the all-boards view failed: %s", slug, exc)
+            entry["error"] = True
+            continue
+        shown = len(part["nodes"])
+        remaining -= shown
+        entry.update(
+            initialized=True,
+            latest_event_id=part["board"]["latest_event_id"],
+            total=part["total_count"],
+            shown=shown,
+            archived_count=part["archived_count"],
+            truncated=part["truncated"],
+        )
+        archived_count += part["archived_count"]
+        total_count += part["total_count"]
+        truncated = truncated or part["truncated"]
+        nodes.extend({**node, "board": slug} for node in part["nodes"])
+        edges.extend({**edge, "board": slug} for edge in part["edges"])
+    return {
+        "schema": _graph_data.GRAPH_SCHEMA_VERSION,
+        "board": {
+            "slug": ALL_BOARDS,
+            "latest_event_id": 0,
+            "initialized": any(item["initialized"] for item in boards_out),
+        },
+        "boards": boards_out,
+        "nodes": nodes,
+        "edges": edges,
+        "archived_count": archived_count,
+        "truncated": truncated,
+        "total_count": total_count,
+    }
+
+
+def _read_graph(path: Path, label: str, include_archived: bool, max_nodes: Optional[int] = None) -> dict[str, Any]:
     conn = _connection(path)
     try:
         # Event tail FIRST: a write between this and the reads below makes the
@@ -310,6 +400,7 @@ def graph(
             latest_event_id=int(latest_event_id),
             known_ids=known_ids,
             archived_count=int(archived_count),
+            **({} if max_nodes is None else {"max_nodes": max_nodes}),
         )
     finally:
         conn.close()

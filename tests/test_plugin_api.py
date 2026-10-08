@@ -801,3 +801,95 @@ def test_graph_cursor_is_read_before_the_snapshot(editable_task):
     finally:
         conn.close()
     assert graph['board']['latest_event_id'] <= tail
+
+
+# --- all boards ---------------------------------------------------------------
+
+def _all_boards_home(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
+    plugin_api.kanban_db.create_board('alpha', name='Alpha')
+    plugin_api.kanban_db.create_board('beta', name='Beta')
+    plugin_api.kanban_db.create_board('old', name='Old')
+    ids = {}
+    for slug in ('alpha', 'beta', 'old'):
+        conn = _connect(slug)
+        try:
+            parent = plugin_api.kanban_db.create_task(conn, title=f'{slug} parent', initial_status='blocked', board=slug)
+            child = plugin_api.kanban_db.create_task(conn, title=f'{slug} child', parents=[parent], initial_status='blocked', board=slug)
+            ids[slug] = (parent, child)
+        finally:
+            conn.close()
+    plugin_api.kanban_db.write_board_metadata('old', archived=True)
+    # A board listed by board.json alone: its database was never created.
+    plugin_api.kanban_db.write_board_metadata('ghost', name='Ghost')
+    return ids
+
+
+def test_all_boards_graph_tags_every_node_and_edge_with_its_board(monkeypatch, tmp_path):
+    ids = _all_boards_home(monkeypatch, tmp_path)
+
+    payload = plugin_api.graph_all(include_archived=False)
+
+    assert payload['board']['slug'] == plugin_api.ALL_BOARDS
+    assert payload['board']['initialized'] is True
+    by_board = {}
+    for node in payload['nodes']:
+        by_board.setdefault(node['board'], set()).add(node['id'])
+    assert by_board == {'alpha': set(ids['alpha']), 'beta': set(ids['beta'])}
+    edges = {(edge['board'], edge['source'], edge['target']) for edge in payload['edges']}
+    assert edges == {('alpha', *ids['alpha']), ('beta', *ids['beta'])}
+    # Edges never cross boards.
+    node_board = {(node['board'], node['id']) for node in payload['nodes']}
+    assert all((edge['board'], edge['source']) in node_board and (edge['board'], edge['target']) in node_board for edge in payload['edges'])
+    meta = {item['slug']: item for item in payload['boards']}
+    assert meta['alpha']['name'] == 'Alpha' and meta['alpha']['total'] == 2 and meta['alpha']['initialized'] is True
+    assert meta['alpha']['latest_event_id'] > 0
+    assert payload['total_count'] == 4 and payload['truncated'] is False
+
+
+def test_all_boards_graph_skips_archived_and_uninitialized_boards(monkeypatch, tmp_path):
+    _all_boards_home(monkeypatch, tmp_path)
+
+    payload = plugin_api.graph_all(include_archived=False)
+
+    slugs = {item['slug'] for item in payload['boards']}
+    assert 'old' not in slugs
+    assert not any(node['board'] in {'old', 'ghost', 'default'} for node in payload['nodes'])
+    meta = {item['slug']: item for item in payload['boards']}
+    assert meta['ghost']['initialized'] is False and meta['ghost']['total'] == 0
+    # Reading never creates a database for a board that has none.
+    assert not plugin_api.kanban_db.kanban_db_path('ghost').exists()
+    assert not plugin_api.kanban_db.kanban_db_path('default').exists()
+
+
+def test_all_boards_graph_applies_a_global_cap_honestly(monkeypatch, tmp_path):
+    _all_boards_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(plugin_api, 'MAX_ALL_NODES', 3)
+
+    payload = plugin_api.graph_all(include_archived=False)
+
+    assert len(payload['nodes']) == 3
+    assert payload['truncated'] is True and payload['total_count'] == 4
+    meta = {item['slug']: item for item in payload['boards']}
+    assert meta['alpha']['truncated'] is False and meta['beta']['truncated'] is True
+    assert meta['beta']['shown'] == 1 and meta['beta']['total'] == 2
+    # The link to the task beyond the cap is counted, not dropped silently.
+    beta = [node for node in payload['nodes'] if node['board'] == 'beta']
+    assert sum(node['truncated_parent_count'] + node['truncated_child_count'] for node in beta) == 1
+
+
+def test_all_boards_sentinel_is_not_a_board_slug(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    with pytest.raises(ValueError):
+        plugin_api.kanban_db._normalize_board_slug(plugin_api.ALL_BOARDS)
+    with pytest.raises(HTTPException) as bad:
+        plugin_api.graph(board=plugin_api.ALL_BOARDS, include_archived=False)
+    assert bad.value.status_code == 400
+
+
+def test_all_boards_route_is_registered_read_only():
+    routes = {(getattr(route, 'path', ''), tuple(sorted(getattr(route, 'methods', None) or ()))) for route in plugin_api.router.routes}
+    assert ('/graph/all', ('GET',)) in routes
