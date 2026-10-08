@@ -1,3 +1,4 @@
+import * as sdk from '@hermes/plugin-sdk'
 import {
   Button,
   Codicon,
@@ -27,20 +28,41 @@ import {
   type ReactFlowInstance
 } from '@xyflow/react'
 import flowCss from '@xyflow/react/dist/style.css'
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode
+} from 'react'
 
 import {
   applyPositionOverrides,
+  coreKanbanEnabled,
+  DEFAULT_MANUAL_MOVES,
   EMPTY_FILTERS,
   filterGraph,
   FOLLOW_KANBAN,
   isTaskNode,
   kanbanBoardStorageKey,
+  kanbanEnabledIn,
+  keyInRoutedScope,
   layoutGraph,
+  layoutLinked,
+  parsePositionStore,
   parseStoredSlug,
+  planLayout,
+  PLUGIN_DECISIONS_KEY,
+  prunePositions,
   resolveBoardSelection,
+  savePosition,
   statusBreakdown,
   statusMeta,
+  statusTargets,
+  stripEventCursor,
   summarizeGraph,
   UNLINKED_SECTION_ID,
   unmetParentCounts,
@@ -48,7 +70,9 @@ import {
   type GraphNode,
   type GraphPayload,
   type GraphTask,
+  type ManualMoves,
   type PositionOverrides,
+  type PositionStore,
   type TaskDetail
 } from './graph'
 import { LOCALES } from './i18n'
@@ -74,6 +98,10 @@ interface BoardsResponse {
   boards: BoardMeta[]
 }
 
+interface WorkflowResponse {
+  manual?: Record<string, string[]>
+}
+
 let api: null | PluginContext['rest'] = null
 let pluginStorage: null | PluginContext['storage'] = null
 let translate: null | PluginContext['i18n']['t'] = null
@@ -82,9 +110,11 @@ const LOCAL_SCOPE = 'local'
 const DEFAULT_VIEW_SETTINGS: ViewSettings = { direction: 'LR', edgeStyle: 'elbow', hideImplied: false, showGrid: true, showMiniMap: true, showMotion: true }
 const GRAPH_ROUTE = '/kanban-graph'
 const GRAPH_POLL_MS = 10_000
+// Like core's drawer: the open task changes rarely and every edit refetches it.
+const DETAIL_POLL_MS = 30_000
 const KANBAN_FOLLOW_POLL_MS = 2_000
+const DISPATCH_DEBOUNCE_MS = 400
 const FIT_OPTIONS = { padding: 0.16, maxZoom: 1.1 }
-type PositionLayouts = Record<string, PositionOverrides>
 const EMPTY_POSITIONS: PositionOverrides = {}
 interface LiveNodes {
   context: string
@@ -108,6 +138,56 @@ function errText(error: unknown): string {
 
 const scopedKey = (key: string, scope: string) => (scope === LOCAL_SCOPE ? key : `${key}.${scope}`)
 
+// ── connection scope ─────────────────────────────────────────────────────────
+//
+// `ctx.rest` sends a request to the connection that is active *now*, which can
+// move before `host.state.connectionId` publishes and before React re-keys the
+// observers. A fetch from an observer still on the outgoing scope's key would
+// then cache the incoming gateway's answer under the outgoing key and paint it
+// on the way back. Like core Kanban's `routedToScope`, only fetch (and only
+// write) while the key's scope is the routed one. Older hosts without
+// `activeConnectionId` skip the gate.
+
+function routedScope(): null | string {
+  const read = host.activeConnectionId
+  return typeof read === 'function' ? read() ?? LOCAL_SCOPE : null
+}
+
+/** Every graph query key is `['kanban-graph', version, scope, ...]`. */
+const routedToScope = (query: { queryKey: readonly unknown[] }): boolean => keyInRoutedScope(query.queryKey, routedScope())
+
+function assertRoutedScope(scope: string): void {
+  const routed = routedScope()
+  if (routed !== null && routed !== scope) throw new Error(translate?.('toast.staleConnection') || 'The connection changed.')
+}
+
+// ── dispatcher nudge ─────────────────────────────────────────────────────────
+
+const pendingNudges = new Map<string, number>()
+
+/**
+ * Core Kanban nudges the dispatcher after every board write so a card moved to
+ * Ready starts without waiting out the dispatcher tick. Same here after a status
+ * change: debounced per board, fire-and-forget, never blocking the edit.
+ */
+function nudgeDispatcher(board: string, scope: string): void {
+  const key = `${scope}\u0000${board}`
+  window.clearTimeout(pendingNudges.get(key))
+  pendingNudges.set(key, window.setTimeout(() => {
+    pendingNudges.delete(key)
+    const routed = routedScope()
+    if (!api || (routed !== null && routed !== scope)) return
+    void api(`/dispatch?board=${encodeURIComponent(board)}`, { method: 'POST', body: {} }).catch(() => undefined)
+  }, DISPATCH_DEBOUNCE_MS))
+}
+
+function cancelNudges(): void {
+  for (const timer of pendingNudges.values()) window.clearTimeout(timer)
+  pendingNudges.clear()
+}
+
+// ── persisted view state ─────────────────────────────────────────────────────
+
 function loadViewSettings(): ViewSettings {
   const saved = pluginStorage?.get<Partial<ViewSettings>>('view-settings', DEFAULT_VIEW_SETTINGS) ?? DEFAULT_VIEW_SETTINGS
   return {
@@ -125,24 +205,7 @@ function loadBoardSelection(scope: string): string {
   return typeof saved === 'string' && saved ? saved : FOLLOW_KANBAN
 }
 
-function loadPositionLayouts(): PositionLayouts {
-  const saved = pluginStorage?.get<unknown>('node-positions', {})
-  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {}
-  const layouts: PositionLayouts = {}
-  for (const [context, rawPositions] of Object.entries(saved)) {
-    if (!rawPositions || typeof rawPositions !== 'object' || Array.isArray(rawPositions)) continue
-    const positions: PositionOverrides = {}
-    for (const [taskId, rawPosition] of Object.entries(rawPositions)) {
-      if (!rawPosition || typeof rawPosition !== 'object' || Array.isArray(rawPosition)) continue
-      const position = rawPosition as { x?: unknown; y?: unknown }
-      if (typeof position.x === 'number' && Number.isFinite(position.x) && typeof position.y === 'number' && Number.isFinite(position.y)) {
-        positions[taskId] = { x: position.x, y: position.y }
-      }
-    }
-    if (Object.keys(positions).length > 0) layouts[context] = positions
-  }
-  return layouts
-}
+const loadPositionStore = (): PositionStore => parsePositionStore(pluginStorage?.get<unknown>('node-positions', {}))
 
 function readKanbanBoardSlug(scope: string): string {
   try {
@@ -177,62 +240,124 @@ function useKanbanBoardSlug(scope: string): string {
   return slug
 }
 
+/**
+ * Whether core Kanban's `/kanban` route exists. It ships off by default; when
+ * it is off, `/kanban` is not a route and the router reads it as a session id.
+ * Read-only: `host.pluginDecisions` on current hosts, its localStorage mirror
+ * on older ones.
+ */
+function isCoreKanbanEnabled(): boolean {
+  const decisions = host.pluginDecisions
+  if (decisions && typeof decisions.get === 'function') return kanbanEnabledIn(decisions.get())
+  try {
+    return coreKanbanEnabled(window.localStorage.getItem(PLUGIN_DECISIONS_KEY))
+  } catch {
+    return false
+  }
+}
+
 function routeFromHash(hash = window.location.hash): string {
-  const target = hash.startsWith('#') ? hash.slice(1) : hash
+  const index = hash.indexOf('#')
+  const target = index === -1 ? hash : hash.slice(index + 1)
   const path = target.split(/[?#]/, 1)[0]
   return path?.startsWith('/') ? path : '/'
+}
+
+/** Full route (path + query) of a hash URL, for returning to exactly that page. */
+function fullRouteFromUrl(url: string): string {
+  const index = url.indexOf('#')
+  const target = index === -1 ? '' : url.slice(index + 1)
+  return target.startsWith('/') ? target : '/'
 }
 
 /**
  * sidebar.nav contributions are route-only in the current Desktop SDK: they
  * expose no click callback or toggle flag. Keep the workaround scoped to this
- * exact contribution and remove it on plugin disposal. The first navigation
- * records the originating page; clicking the active row returns there.
+ * exact contribution and remove it on plugin disposal. Clicking the active row
+ * returns to the page the graph was opened from.
+ *
+ * The sidebar navigates with react-router's `pushState`, which fires no
+ * `hashchange`, so the origin is recorded when our row is clicked (capture
+ * phase, before the router moves). `hashchange` (`host.navigate`, palette)
+ * carries the origin in `oldURL`.
  */
 function installSidebarToggle(navLabel: () => string) {
-  let lastPath = routeFromHash()
-  let returnPath = lastPath === GRAPH_ROUTE
-    ? pluginStorage?.get<string>('sidebar-return-route', '/') ?? '/'
-    : lastPath
+  let returnPath = pluginStorage?.get<string>('sidebar-return-route', '/') ?? '/'
 
-  const recordRoute = () => {
-    const nextPath = routeFromHash()
-    if (nextPath === GRAPH_ROUTE && lastPath !== GRAPH_ROUTE) {
-      returnPath = lastPath
-      pluginStorage?.set('sidebar-return-route', returnPath)
-    } else if (nextPath !== GRAPH_ROUTE) {
-      returnPath = nextPath
-    }
-    lastPath = nextPath
+  const remember = (route: string) => {
+    if (routeFromHash(route) === GRAPH_ROUTE) return
+    returnPath = route
+    pluginStorage?.set('sidebar-return-route', route)
   }
-
-  const toggleActiveRow = (event: MouseEvent) => {
-    if (routeFromHash() !== GRAPH_ROUTE || !(event.target instanceof Element)) return
+  const onHashChange = (event: HashChangeEvent) => {
+    if (routeFromHash() === GRAPH_ROUTE && event.oldURL) remember(fullRouteFromUrl(event.oldURL))
+  }
+  const onClick = (event: MouseEvent) => {
+    if (!(event.target instanceof Element)) return
     const button = event.target.closest<HTMLButtonElement>('button[data-sidebar="menu-button"]')
     if (!button || button.textContent?.trim() !== navLabel()) return
-
+    if (routeFromHash() !== GRAPH_ROUTE) {
+      remember(fullRouteFromUrl(window.location.href))
+      return
+    }
     event.preventDefault()
     event.stopPropagation()
     event.stopImmediatePropagation()
-    host.navigate(returnPath && returnPath !== GRAPH_ROUTE ? returnPath : '/')
+    host.navigate(returnPath && routeFromHash(returnPath) !== GRAPH_ROUTE ? returnPath : '/')
   }
 
-  window.addEventListener('hashchange', recordRoute)
-  document.addEventListener('click', toggleActiveRow, true)
+  window.addEventListener('hashchange', onHashChange)
+  document.addEventListener('click', onClick, true)
   return () => {
-    window.removeEventListener('hashchange', recordRoute)
-    document.removeEventListener('click', toggleActiveRow, true)
+    window.removeEventListener('hashchange', onHashChange)
+    document.removeEventListener('click', onClick, true)
   }
 }
 
-function TaskInspectorController({ board, children, onClose, onOpenKanban, onRefresh, onSelect, parents, scope, task }: {
+/** Escape that belongs to a field, menu or popover: let that thing handle it. */
+function escapeIsForInnerControl(event: KeyboardEvent): boolean {
+  const target = event.target
+  if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="menu"], [role="listbox"]')) {
+    return true
+  }
+  if (document.querySelector('[role="menu"], [role="listbox"]')) return true
+  // Any open popover except a hover tooltip.
+  return [...document.querySelectorAll('[data-radix-popper-content-wrapper]')].some(wrapper => !wrapper.querySelector('[role="tooltip"]'))
+}
+
+/** Board switcher placement: the workspace page header on hosts that have it. */
+function PageHeaderControl({ children }: { children: ReactNode }) {
+  const HeaderControl = sdk.WorkspacePageHeaderControl
+  return HeaderControl
+    ? <HeaderControl id="kanban-graph:board-switcher">{children}</HeaderControl>
+    : <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">{children}</Contribute>
+}
+
+function TaskInspectorController({
+  board,
+  children,
+  manual,
+  onClose,
+  onOpenKanban,
+  onRefresh,
+  onSelect,
+  openKanbanLabel,
+  parents,
+  refetchRef,
+  scope,
+  task
+}: {
   board: string
   children: GraphTask[]
+  manual: ManualMoves
   onClose: () => void
   onOpenKanban: () => void
   onRefresh: () => Promise<unknown>
   onSelect: (task: GraphTask) => void
+  openKanbanLabel: string
   parents: GraphTask[]
+  /** Lets the toolbar's refresh button refetch this open detail too. */
+  refetchRef: { current: null | (() => Promise<unknown>) }
   scope: string
   task: GraphTask
 }) {
@@ -244,8 +369,16 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
   const detailQuery = useQuery<TaskDetail>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'task', board, task.id],
     queryFn: () => api!(taskPath),
-    refetchInterval: GRAPH_POLL_MS
+    enabled: routedToScope,
+    refetchInterval: DETAIL_POLL_MS
   })
+  const refetchDetail = detailQuery.refetch
+  useEffect(() => {
+    refetchRef.current = refetchDetail
+    return () => {
+      if (refetchRef.current === refetchDetail) refetchRef.current = null
+    }
+  }, [refetchDetail, refetchRef])
 
   const refresh = async () => {
     await Promise.all([detailQuery.refetch(), onRefresh()])
@@ -253,6 +386,7 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
   const saveContent = async (patch: { title?: string; body?: string }) => {
     setSavingContent(true)
     try {
+      assertRoutedScope(scope)
       await api!(taskPath, { method: 'PATCH', body: patch })
       await refresh()
       host?.notify({ kind: 'success', message: t('toast.updated') })
@@ -267,6 +401,7 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
   const addComment = async (body: string) => {
     setSavingComment(true)
     try {
+      assertRoutedScope(scope)
       await api!(`/tasks/${encodeURIComponent(task.id)}/comments?board=${encodeURIComponent(board)}`, {
         method: 'POST',
         body: { body }
@@ -286,7 +421,9 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
     if (status === current) return true
     setPendingStatus(status)
     try {
+      assertRoutedScope(scope)
       await api!(taskPath, { method: 'PATCH', body: summary ? { status, summary } : { status } })
+      nudgeDispatcher(board, scope)
       await refresh()
       host?.notify({ kind: 'success', message: t('toast.moved', statusLabel(t, status)) })
       return true
@@ -298,9 +435,16 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
     }
   }
 
-  // Detail rows lack the graph-only fields (hidden link counts); keep them.
+  // Detail rows lack the graph-only fields (hidden/truncated link counts); keep them.
   const currentTask: GraphTask = detailQuery.data?.task
-    ? { ...task, ...detailQuery.data.task, hidden_parent_count: task.hidden_parent_count, hidden_child_count: task.hidden_child_count }
+    ? {
+        ...task,
+        ...detailQuery.data.task,
+        hidden_parent_count: task.hidden_parent_count,
+        hidden_child_count: task.hidden_child_count,
+        truncated_parent_count: task.truncated_parent_count,
+        truncated_child_count: task.truncated_child_count
+      }
     : task
   const displayedTask = pendingStatus ? { ...currentTask, status: pendingStatus } : currentTask
 
@@ -316,6 +460,7 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
       onChangeStatus={changeStatus}
       onClose={onClose}
       onOpenKanban={onOpenKanban}
+      openKanbanLabel={openKanbanLabel}
       onRetry={() => void detailQuery.refetch()}
       onSaveContent={saveContent}
       onSelect={onSelect}
@@ -323,6 +468,7 @@ function TaskInspectorController({ board, children, onClose, onOpenKanban, onRef
       savingComment={savingComment}
       savingContent={savingContent}
       savingStatus={pendingStatus !== null}
+      statusTargets={statusTargets(currentTask.status, manual)}
       task={displayedTask}
     />
   )
@@ -338,13 +484,18 @@ function GraphPage() {
   const [filters, setFilters] = useState<GraphFilters>(EMPTY_FILTERS)
   const [settings, setSettings] = useState<ViewSettings>(loadViewSettings)
   const [unlinkedCollapsed, setUnlinkedCollapsed] = useState(() => pluginStorage?.get<boolean>('unlinked-collapsed', false) === true)
-  const [positionLayouts, setPositionLayouts] = useState<PositionLayouts>(loadPositionLayouts)
+  const [positionStore, setPositionStore] = useState<PositionStore>(loadPositionStore)
   const [liveNodes, setLiveNodes] = useState<LiveNodes>({ context: '', signature: '', nodes: [] })
+  const [dragging, setDragging] = useState(false)
   const flowRef = useRef<ReactFlowInstance<GraphNode> | null>(null)
-  const positionLayoutsRef = useRef(positionLayouts)
+  const positionStoreRef = useRef(positionStore)
   const fitContextRef = useRef<string | null>(null)
   const restoreFocusRef = useRef<HTMLElement | null>(null)
   const restoreNodeIdRef = useRef<string | null>(null)
+  const detailRefetchRef = useRef<null | (() => Promise<unknown>)>(null)
+  const refetchedForSlugRef = useRef('')
+  // Search runs on every card; let typing stay responsive on large boards.
+  const deferredQuery = useDeferredValue(filters.query)
 
   // A different gateway has different boards: reload that connection's choice.
   useEffect(() => setSelection(loadBoardSelection(scope)), [scope])
@@ -352,9 +503,17 @@ function GraphPage() {
   const boardsQuery = useQuery<BoardsResponse>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'boards'],
     queryFn: () => api!('/boards'),
+    enabled: routedToScope,
     staleTime: 15_000,
     refetchInterval: 30_000
   })
+  const workflowQuery = useQuery<WorkflowResponse>({
+    queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'workflow'],
+    queryFn: () => api!('/workflow'),
+    enabled: routedToScope,
+    staleTime: 5 * 60_000
+  })
+  const manual: ManualMoves = workflowQuery.data?.manual ?? DEFAULT_MANUAL_MOVES
   const availableBoards = useMemo(() => (boardsQuery.data?.boards ?? []).filter(item => !item.archived), [boardsQuery.data])
   const followedSlug = resolveBoardSelection({
     boards: availableBoards,
@@ -371,17 +530,24 @@ function GraphPage() {
   const graphQuery = useQuery<GraphPayload>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'graph', boardValue, includeArchived],
     queryFn: () => api!(`/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`),
-    enabled: Boolean(boardValue),
+    enabled: query => Boolean(boardValue) && routedToScope(query),
+    // Same board, other archive filter: keep the canvas (and its zoom) while loading.
+    placeholderData: previous => (previous?.board.slug === boardValue ? previous : undefined),
+    // The event cursor moves on every worker heartbeat; without it an unchanged
+    // board keeps its identity and nothing downstream recomputes.
+    select: stripEventCursor,
     refetchInterval: GRAPH_POLL_MS
   })
   const positionContext = boardValue
     ? (scope === LOCAL_SCOPE ? `${boardValue}:${settings.direction}` : `${scope}:${boardValue}:${settings.direction}`)
     : ''
-  const positionOverrides = positionContext ? positionLayouts[positionContext] ?? EMPTY_POSITIONS : EMPTY_POSITIONS
+  const positionOverrides = positionContext ? positionStore[positionContext]?.positions ?? EMPTY_POSITIONS : EMPTY_POSITIONS
 
   const payload = boardValue && graphQuery.data?.board.slug === boardValue ? graphQuery.data : undefined
+  const refreshing = Boolean(payload) && graphQuery.isPlaceholderData
+  const searchFilters = useMemo(() => ({ ...filters, query: deferredQuery }), [deferredQuery, filters])
   const selected = useMemo(() => payload?.nodes.find(task => task.id === selectedId) ?? null, [payload, selectedId])
-  const filtered = useMemo(() => payload ? filterGraph(payload, filters) : null, [payload, filters])
+  const filtered = useMemo(() => payload ? filterGraph(payload, searchFilters) : null, [payload, searchFilters])
   const decorated = useMemo(() => {
     if (!filtered || !payload) return null
     const counts = new Map<string, number>()
@@ -396,20 +562,33 @@ function GraphPage() {
       nodes: filtered.nodes.map(task => ({ ...task, _linkCount: counts.get(task.id) ?? 0, _unmet: unmet.get(task.id) ?? 0 }))
     }
   }, [filtered, payload])
+  const plan = useMemo(
+    () => decorated ? planLayout(decorated, settings.hideImplied, settings.direction) : null,
+    [decorated, settings.direction, settings.hideImplied]
+  )
+  // Dagre only re-runs when the linked structure changes, not on status,
+  // title or summary updates.
+  const structureKey = plan?.structureKey ?? ''
+  const linkedLayout = useMemo(
+    () => plan ? layoutLinked(plan, settings.direction) : null,
+    // Keyed on the structure on purpose: `plan` changes identity on every data update.
+    [structureKey]
+  )
   const autoElements = useMemo(
-    () => decorated
-      ? layoutGraph(decorated, settings.direction, settings.edgeStyle, settings.showMotion, { hideImplied: settings.hideImplied, unlinkedCollapsed })
+    () => decorated && plan && linkedLayout
+      ? layoutGraph(decorated, settings.direction, settings.edgeStyle, settings.showMotion, { plan, linkedLayout, unlinkedCollapsed })
       : { nodes: [], edges: [], linkedCount: 0, unlinkedCount: 0, impliedCount: 0 },
-    [decorated, settings.direction, settings.edgeStyle, settings.hideImplied, settings.showMotion, unlinkedCollapsed]
+    [decorated, linkedLayout, plan, settings.direction, settings.edgeStyle, settings.showMotion, unlinkedCollapsed]
   )
   const positionedNodes = useMemo(
     () => applyPositionOverrides(autoElements.nodes, positionOverrides),
     [autoElements, positionOverrides]
   )
   const nodeSignature = useMemo(() => positionedNodes.map(node => node.id).join('\u0000'), [positionedNodes])
-  const displayedNodes = liveNodes.context === positionContext && liveNodes.signature === nodeSignature
-    ? liveNodes.nodes
-    : positionedNodes
+  // While a card is being dragged, keep React Flow's live copy no matter what
+  // a background refetch brought in; the drop re-syncs.
+  const liveCurrent = liveNodes.context === positionContext && (dragging || liveNodes.signature === nodeSignature)
+  const displayedNodes = liveCurrent ? liveNodes.nodes : positionedNodes
   const stats = useMemo(() => filtered ? summarizeGraph(filtered) : null, [filtered])
   const chips = useMemo(() => statusBreakdown(payload?.nodes ?? []), [payload])
   const assignees = useMemo(() => [...new Set((payload?.nodes ?? []).map(node => node.assignee).filter(Boolean) as string[])].sort(), [payload])
@@ -475,44 +654,39 @@ function GraphPage() {
     }
   }, [payload, selected])
 
+  const writePositionStore = (next: PositionStore) => {
+    if (next === positionStoreRef.current) return
+    positionStoreRef.current = next
+    setPositionStore(next)
+    pluginStorage?.set('node-positions', next)
+  }
   const patchFilters = (patch: Partial<GraphFilters>) => setFilters(current => ({ ...current, ...patch }))
   const patchSettings = (patch: Partial<ViewSettings>) => setSettings(current => ({ ...current, ...patch }))
   const fitView = () => void flowRef.current?.fitView({ ...FIT_OPTIONS, duration: 220 })
   const onNodesChange = (changes: NodeChange<GraphNode>[]) => {
     if (!positionContext) return
-    setLiveNodes(current => ({
-      context: positionContext,
-      signature: nodeSignature,
-      nodes: applyNodeChanges(
-        changes,
-        current.context === positionContext && current.signature === nodeSignature ? current.nodes : positionedNodes
-      )
-    }))
+    setLiveNodes(current => {
+      const reuse = current.context === positionContext && (dragging || current.signature === nodeSignature)
+      return {
+        context: positionContext,
+        signature: reuse ? current.signature : nodeSignature,
+        nodes: applyNodeChanges(changes, reuse ? current.nodes : positionedNodes)
+      }
+    })
   }
   const persistNodePosition = (node: GraphNode) => {
     if (!positionContext || !isTaskNode(node)) return
-    const current = positionLayoutsRef.current
-    const next = {
-      ...current,
-      [positionContext]: {
-        ...(current[positionContext] ?? {}),
-        [node.id]: { x: node.position.x, y: node.position.y }
-      }
-    }
-    positionLayoutsRef.current = next
-    setPositionLayouts(next)
-    pluginStorage?.set('node-positions', next)
+    writePositionStore(savePosition(positionStoreRef.current, positionContext, node.id, {
+      x: node.position.x,
+      y: node.position.y,
+      linked: Boolean(node.data._linked)
+    }))
   }
   const resetNodePositions = () => {
-    if (!positionContext) return
-    setPositionLayouts(current => {
-      if (!(positionContext in current)) return current
-      const next = { ...current }
-      delete next[positionContext]
-      positionLayoutsRef.current = next
-      pluginStorage?.set('node-positions', next)
-      return next
-    })
+    if (!positionContext || !(positionContext in positionStoreRef.current)) return
+    const next = { ...positionStoreRef.current }
+    delete next[positionContext]
+    writePositionStore(next)
     requestAnimationFrame(fitView)
   }
   const chooseBoard = (next: string) => {
@@ -530,6 +704,32 @@ function GraphPage() {
     if (unlinkedCollapsed) toggleUnlinked()
     setSelectedId(task.id)
   }
+  const refreshAll = () => {
+    void graphQuery.refetch()
+    void boardsQuery.refetch()
+    void detailRefetchRef.current?.()
+  }
+
+  // "Open in Kanban": core's page only exists when its plugin is enabled, and it
+  // shows its own board selection, which a plugin cannot set.
+  const kanbanEnabled = isCoreKanbanEnabled()
+  const boardName = (slug: string) => {
+    const board = availableBoards.find(item => item.slug === slug)
+    return board?.name || board?.slug || slug
+  }
+  const openKanbanLabel = !kanbanEnabled
+    ? t('state.kanbanDisabled')
+    : boardValue && followedSlug && boardValue !== followedSlug
+      ? t('inspector.openKanbanOther', boardName(followedSlug))
+      : t('inspector.openKanban')
+  const openKanban = () => {
+    if (!isCoreKanbanEnabled()) {
+      host.notify({ kind: 'warning', message: t('state.kanbanDisabled') })
+      return
+    }
+    host.navigate('/kanban')
+  }
+
   const hasFilters = Boolean(filters.query || filters.status || filters.assignee || filters.tenant || filters.linkedOnly || includeArchived)
   const inspectorOpen = Boolean(selectedId)
   const loadError = (!boardsQuery.data && boardsQuery.error) || (!payload && graphQuery.error)
@@ -537,7 +737,22 @@ function GraphPage() {
   const archivedHidden = !includeArchived ? payload?.archived_count ?? 0 : 0
 
   useEffect(() => pluginStorage?.set('view-settings', settings), [settings])
+  // Core just created or imported a board we have not listed yet: refetch once.
   useEffect(() => {
+    if (!kanbanSlug || !boardsQuery.data || refetchedForSlugRef.current === kanbanSlug) return
+    if (availableBoards.some(board => board.slug === kanbanSlug)) return
+    refetchedForSlugRef.current = kanbanSlug
+    void boardsQuery.refetch()
+  }, [availableBoards, boardsQuery, kanbanSlug])
+  // Drop saved positions of tasks that are gone. Only a complete payload (no
+  // archived tasks held back, nothing truncated) can tell "gone" from "hidden".
+  useEffect(() => {
+    if (!payload || !positionContext || refreshing || payload.truncated) return
+    if (!includeArchived && (payload.archived_count ?? 0) > 0) return
+    writePositionStore(prunePositions(positionStoreRef.current, positionContext, new Set(payload.nodes.map(task => task.id))))
+  }, [includeArchived, payload, positionContext, refreshing])
+  useEffect(() => {
+    if (dragging) return
     setLiveNodes(current => {
       const previous = current.context === positionContext
         ? new Map(current.nodes.map(node => [node.id, node]))
@@ -551,7 +766,7 @@ function GraphPage() {
         })
       }
     })
-  }, [nodeSignature, positionContext, positionedNodes])
+  }, [dragging, nodeSignature, positionContext, positionedNodes])
   useEffect(() => {
     if (!payload || focusedNodes.length === 0) return
     const context = `${scope}:${payload.board.slug}:${settings.direction}`
@@ -564,10 +779,10 @@ function GraphPage() {
     return () => cancelAnimationFrame(frame)
   }, [focusedNodes.length, payload?.board.slug, scope, settings.direction])
   useEffect(() => {
-    if (!selectedId || !filtered) return
+    if (!selectedId || !filtered || refreshing) return
     const visible = filtered.nodes.some(task => task.id === selectedId) && displayedNodes.some(node => node.id === selectedId)
     if (!visible) setSelectedId(null)
-  }, [displayedNodes, filtered, selectedId])
+  }, [displayedNodes, filtered, refreshing, selectedId])
   useEffect(() => {
     if (!inspectorOpen) return
     restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -594,38 +809,45 @@ function GraphPage() {
   }, [selectedId])
   useEffect(() => {
     if (!inspectorOpen) return
+    // Capture phase: decide while an open menu is still in the DOM. Escape in a
+    // field, menu or popover belongs to it; only a bare Escape closes the drawer.
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !event.defaultPrevented) setSelectedId(null)
+      if (event.key !== 'Escape' || event.defaultPrevented || escapeIsForInnerControl(event)) return
+      setSelectedId(null)
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [inspectorOpen])
 
+  const openKanbanAction = kanbanEnabled
+    ? <Button onClick={openKanban} size="sm" variant="outline">{t('state.openKanban')}</Button>
+    : <p className="hkg-drawer-muted hkg-state-note">{t('state.kanbanDisabled')}</p>
   const renderEmpty = () => {
     if (hasFilters) {
       return <div className="hkg-state"><EmptyState description={t('state.noMatchHint')} title={t('state.noMatch')} /><Button onClick={clearFilters} size="sm" variant="outline">{t('state.clearFilters')}</Button></div>
     }
     if (payload?.board.initialized === false) {
-      return <div className="hkg-state"><EmptyState description={t('state.notInitializedHint')} title={t('state.notInitialized')} /><Button onClick={() => host.navigate('/kanban')} size="sm" variant="outline">{t('state.openKanban')}</Button></div>
+      return <div className="hkg-state"><EmptyState description={t('state.notInitializedHint')} title={t('state.notInitialized')} />{openKanbanAction}</div>
     }
     if (archivedHidden > 0) {
       return <div className="hkg-state"><EmptyState description={t('state.allArchivedHint')} title={t('state.allArchived', archivedHidden)} /><Button onClick={() => setIncludeArchived(true)} size="sm" variant="outline">{t('state.showArchived')}</Button></div>
     }
-    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t('state.empty')} /><Button onClick={() => host.navigate('/kanban')} size="sm" variant="outline">{t('state.openKanban')}</Button></div>
+    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t('state.empty')} />{openKanbanAction}</div>
   }
 
   return (
     <main className="hkg-root">
-      <Contribute area={TITLEBAR_AREAS.center} id="kanban-graph:board-switcher">
-        <BoardSwitcher boards={availableBoards} followedSlug={followedSlug} onChange={chooseBoard} selection={selection} />
-      </Contribute>
       <header className="hkg-toolbar">
         <h1>{t('title')}</h1>
+        <PageHeaderControl>
+          <BoardSwitcher boards={availableBoards} followedSlug={followedSlug} onChange={chooseBoard} selection={selection} />
+        </PageHeaderControl>
         <span className="hkg-count">{filtered?.nodes.length ?? payload?.nodes.length ?? 0}</span>
         <FilterMenu assignees={assignees} filters={filters} includeArchived={includeArchived} onArchived={setIncludeArchived} onChange={patchFilters} tenants={tenants} />
-        <SearchField aria-label={t('toolbar.filterTasks')} className="hkg-search" onChange={(value: string) => patchFilters({ query: value })} placeholder={t('toolbar.filterTasks')} value={filters.query} />
+        <SearchField aria-label={t('toolbar.filterTasks')} containerClassName="hkg-search" onChange={(value: string) => patchFilters({ query: value })} placeholder={t('toolbar.filterTasks')} value={filters.query} />
         <StatusChips active={filters.status} counts={chips} onToggle={status => patchFilters({ status: filters.status === status ? '' : status })} />
         <div className="hkg-spacer" />
+        {refreshing && <span className="hkg-refreshing" role="status"><Loader size="xs" />{t('state.refreshing')}</span>}
         {archivedHidden > 0 && (
           <button className="hkg-archived-hint" onClick={() => setIncludeArchived(true)} type="button">
             <Codicon name="archive" size="0.7rem" />{t('state.archivedHidden', archivedHidden)}
@@ -639,10 +861,12 @@ function GraphPage() {
           onResetPositions={resetNodePositions}
           settings={settings}
         />
-        <RefreshButton onRefresh={() => { void graphQuery.refetch(); void boardsQuery.refetch() }} refreshing={graphQuery.isFetching} />
+        <RefreshButton onRefresh={refreshAll} refreshing={graphQuery.isFetching} />
       </header>
-      {payload?.truncated && <div className="hkg-banner"><Codicon name="warning" size="0.75rem" />{t('state.truncated', payload.nodes.length)}</div>}
-      <section className="hkg-canvas">
+      {payload?.truncated && (
+        <div className="hkg-banner"><Codicon name="warning" size="0.75rem" />{t('state.truncated', payload.nodes.length, payload.total_count ?? payload.nodes.length)}</div>
+      )}
+      <section className={refreshing ? 'hkg-canvas hkg-canvas-refreshing' : 'hkg-canvas'}>
         {loadError ? (
           <div className="hkg-state"><ErrorState description={errText(loadError)} title={t('state.loadError')} /><Button onClick={() => void (boardsQuery.error ? boardsQuery.refetch() : graphQuery.refetch())} size="sm" variant="outline">{t('state.retry')}</Button></div>
         ) : loading ? (
@@ -661,7 +885,11 @@ function GraphPage() {
             nodesConnectable={false}
             nodesDraggable
             nodeTypes={NODE_TYPES}
-            onNodeDragStop={(_event, node) => persistNodePosition(node)}
+            onNodeDragStart={() => setDragging(true)}
+            onNodeDragStop={(_event, node) => {
+              persistNodePosition(node)
+              setDragging(false)
+            }}
             onNodeClick={(_event, node) => activateNode(node.id)}
             onNodesChange={onNodesChange}
             onInit={instance => { flowRef.current = instance }}
@@ -689,14 +917,17 @@ function GraphPage() {
         {focusedNodes.length > 0 && <div className="hkg-canvas-hint"><span>{t('canvas.linked', stats?.linked ?? 0)}</span><span>{t('canvas.hint')}</span></div>}
         {selected && (
           <TaskInspectorController
-            key={`${boardValue}:${selected.id}`}
+            key={`${scope}:${boardValue}:${selected.id}`}
             board={boardValue}
             children={relationships.children}
+            manual={manual}
             onClose={() => setSelectedId(null)}
-            onOpenKanban={() => host.navigate('/kanban')}
+            onOpenKanban={openKanban}
             onRefresh={() => graphQuery.refetch()}
             onSelect={selectRelationship}
+            openKanbanLabel={openKanbanLabel}
             parents={relationships.parents}
+            refetchRef={detailRefetchRef}
             scope={scope}
             task={selected}
           />
@@ -729,6 +960,7 @@ export default {
     const disposeStyles = installStyles()
     const disposeSidebarToggle = installSidebarToggle(navLabel)
     const disposeApi = () => {
+      cancelNudges()
       api = null
       pluginStorage = null
       translate = null

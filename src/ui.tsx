@@ -38,13 +38,12 @@ import {
   type EdgeProps,
   type NodeProps
 } from '@xyflow/react'
-import { memo, useEffect, useState, type ChangeEvent, type CSSProperties, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type ChangeEvent, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react'
 
 import {
   FOLLOW_KANBAN,
   isAdminSummary,
   statusMeta,
-  statusTargets,
   TASK_STATUSES,
   type EdgeStyle,
   type GraphFilters,
@@ -185,6 +184,7 @@ function TaskCardView({ data, selected }: NodeProps<TaskNode>) {
   const linkCount = Number(data._linkCount ?? 0)
   const unmet = Number(data._unmet ?? 0)
   const hidden = Number(data.hidden_parent_count ?? 0) + Number(data.hidden_child_count ?? 0)
+  const truncated = Number(data.truncated_parent_count ?? 0) + Number(data.truncated_child_count ?? 0)
 
   return (
     <div
@@ -204,6 +204,7 @@ function TaskCardView({ data, selected }: NodeProps<TaskNode>) {
         <div className="hkg-node-meta">
           {unmet > 0 && <span className="hkg-node-unmet" title={t('node.unmet', unmet)}><Codicon name="debug-pause" size="0.65rem" />{unmet}</span>}
           {hidden > 0 && <span className="hkg-node-hidden" title={t('node.hiddenDeps', hidden)}><Codicon name="eye-closed" size="0.65rem" />{hidden}</span>}
+          {truncated > 0 && <span className="hkg-node-hidden" title={t('node.truncatedDeps', truncated)}><Codicon name="ellipsis" size="0.65rem" />{truncated}</span>}
           {data.priority !== 0 && <span className="hkg-priority"><Codicon name="arrow-up" size="0.65rem" />{data.priority}</span>}
           {linkCount > 0 && <span title={t('node.links', linkCount)}><Codicon name="references" size="0.65rem" />{linkCount}</span>}
           <span className="hkg-short-id">{shortId(data.id)}</span>
@@ -473,7 +474,13 @@ function DependencySide({ label, onSelect, tasks }: { label: string; onSelect: (
   )
 }
 
-function StatusMenu({ disabled, onChange, status }: { disabled: boolean; onChange: (status: string) => void; status: string }) {
+function StatusMenu({ disabled, onChange, status, targets }: {
+  disabled: boolean
+  onChange: (status: string) => void
+  status: string
+  /** Current status plus the moves core accepts from it (see `statusTargets`). */
+  targets: readonly string[]
+}) {
   const t = useT()
   const meta = statusMeta(status)
   return (
@@ -492,7 +499,7 @@ function StatusMenu({ disabled, onChange, status }: { disabled: boolean; onChang
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
-        {statusTargets(status).map(target => {
+        {targets.map(target => {
           const targetMeta = statusMeta(target)
           return (
             <DropdownMenuItem key={target} onSelect={() => target !== status && onChange(target)}>
@@ -518,6 +525,7 @@ export function Inspector({
   onChangeStatus,
   onClose,
   onOpenKanban,
+  openKanbanLabel,
   onRetry,
   onSaveContent,
   onSelect,
@@ -525,6 +533,7 @@ export function Inspector({
   savingComment,
   savingContent,
   savingStatus,
+  statusTargets,
   task
 }: {
   children: GraphTask[]
@@ -537,6 +546,7 @@ export function Inspector({
   onChangeStatus: (status: string, summary?: string) => Promise<boolean>
   onClose: () => void
   onOpenKanban: () => void
+  openKanbanLabel: string
   onRetry: () => void
   onSaveContent: (patch: { title?: string; body?: string }) => Promise<boolean>
   onSelect: (task: GraphTask) => void
@@ -544,6 +554,7 @@ export function Inspector({
   savingComment: boolean
   savingContent: boolean
   savingStatus: boolean
+  statusTargets: readonly string[]
   task: GraphTask
 }) {
   const t = useT()
@@ -565,18 +576,43 @@ export function Inspector({
     setDraftBody(task.body || '')
   }, [editingBody, task.body, task.id])
 
+  // The latest drafts, read after an await: a save that resolves late must not
+  // close an editor or clear a composer the user has typed into since.
+  const latest = useRef({ body: draftBody, comment, title: draftTitle })
+  latest.current = { body: draftBody, comment, title: draftTitle }
+
   const saveTitle = async () => {
     const title = draftTitle.trim()
     if (!title) return
-    if (await onSaveContent({ title })) setEditingTitle(false)
+    if (await onSaveContent({ title }) && latest.current.title.trim() === title) setEditingTitle(false)
   }
   const saveBody = async () => {
-    if (await onSaveContent({ body: draftBody })) setEditingBody(false)
+    const body = draftBody
+    if (await onSaveContent({ body }) && latest.current.body === body) setEditingBody(false)
   }
   const addComment = async () => {
     const body = comment.trim()
     if (!body) return
-    if (await onAddComment(body)) setComment('')
+    if (await onAddComment(body)) setComment(current => (current.trim() === body ? '' : current))
+  }
+  const cancelTitle = () => {
+    setDraftTitle(task.title)
+    setEditingTitle(false)
+  }
+  const cancelBody = () => {
+    setDraftBody(task.body || '')
+    setEditingBody(false)
+  }
+  const cancelCompletion = () => {
+    setCompleting(false)
+    setCompletionSummary('')
+  }
+  // Escape inside an editor cancels that editor only; the drawer stays open.
+  const onEscape = (cancel: () => void) => (event: KeyboardEvent) => {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    event.stopPropagation()
+    cancel()
   }
   const requestStatus = (status: string) => {
     // Kanban refuses to complete a card without result evidence unless it is
@@ -592,31 +628,32 @@ export function Inspector({
     if (!summary) return
     if (await onChangeStatus('done', summary)) {
       setCompleting(false)
-      setCompletionSummary('')
+      setCompletionSummary(current => (current.trim() === summary ? '' : current))
     }
   }
   const hiddenLinks = Number(task.hidden_parent_count ?? 0) + Number(task.hidden_child_count ?? 0)
-  const latest = task.latest_summary && !isAdminSummary(task.latest_summary) ? task.latest_summary : ''
+  const truncatedLinks = Number(task.truncated_parent_count ?? 0) + Number(task.truncated_child_count ?? 0)
+  const latestSummary = task.latest_summary && !isAdminSummary(task.latest_summary) ? task.latest_summary : ''
 
   return (
     <aside className="hkg-inspector" aria-label={t('inspector.label')}>
       <header className="hkg-inspector-head">
         <div className="hkg-inspector-topline">
           <div className="hkg-inspector-status-row">
-            {detailReady && <StatusMenu disabled={savingStatus} onChange={requestStatus} status={task.status} />}
+            {detailReady && <StatusMenu disabled={savingStatus} onChange={requestStatus} status={task.status} targets={statusTargets} />}
             <span className="hkg-task-id">{shortId(task.id)}</span>
           </div>
           <div className="hkg-inspector-head-actions">
             <CopyButton appearance="icon" buttonSize="icon-xs" text={task.id} />
-            <Tip label={t('inspector.openKanban')}><Button aria-label={t('inspector.openKanban')} onClick={onOpenKanban} size="icon-xs" variant="ghost"><Codicon name="project" /></Button></Tip>
+            <Tip label={openKanbanLabel}><Button aria-label={openKanbanLabel} onClick={onOpenKanban} size="icon-xs" variant="ghost"><Codicon name="project" /></Button></Tip>
             <Button aria-label={t('inspector.close')} onClick={onClose} size="icon-xs" variant="ghost"><Codicon name="close" /></Button>
           </div>
         </div>
         {detailReady && (editingTitle ? (
           <div className="hkg-title-editor">
-            <Input autoFocus onChange={(event: ChangeEvent<HTMLInputElement>) => setDraftTitle(event.target.value)} value={draftTitle} />
+            <Input autoFocus onChange={(event: ChangeEvent<HTMLInputElement>) => setDraftTitle(event.target.value)} onKeyDown={onEscape(cancelTitle)} value={draftTitle} />
             <div className="hkg-inline-editor-actions">
-              <Button disabled={savingContent} onClick={() => { setDraftTitle(task.title); setEditingTitle(false) }} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
+              <Button disabled={savingContent} onClick={cancelTitle} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
               <Button disabled={savingContent || !draftTitle.trim()} onClick={() => void saveTitle()} size="xs" variant="primary">{savingContent ? <Loader size="xs" /> : t('inspector.save')}</Button>
             </div>
           </div>
@@ -627,9 +664,9 @@ export function Inspector({
           <div className="hkg-complete-form">
             <div className="hkg-section-label">{t('inspector.completeTitle')}</div>
             <p className="hkg-drawer-muted">{t('inspector.completeHint')}</p>
-            <Textarea autoFocus onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setCompletionSummary(event.target.value)} placeholder={t('inspector.completePlaceholder')} value={completionSummary} />
+            <Textarea autoFocus onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setCompletionSummary(event.target.value)} onKeyDown={onEscape(cancelCompletion)} placeholder={t('inspector.completePlaceholder')} value={completionSummary} />
             <div className="hkg-inline-editor-actions">
-              <Button disabled={savingStatus} onClick={() => { setCompleting(false); setCompletionSummary('') }} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
+              <Button disabled={savingStatus} onClick={cancelCompletion} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
               <Button disabled={savingStatus || !completionSummary.trim()} onClick={() => void submitCompletion()} size="xs" variant="primary">{savingStatus ? <Loader size="xs" /> : t('inspector.complete')}</Button>
             </div>
           </div>
@@ -652,9 +689,9 @@ export function Inspector({
           <div className="hkg-section-label">{t('inspector.description')}<Button aria-label={t('inspector.editDescription')} onClick={() => setEditingBody(true)} size="icon-xs" variant="ghost"><Codicon name="edit" size="0.7rem" /></Button></div>
           {editingBody ? (
             <div className="hkg-body-editor-wrap">
-              <Textarea autoFocus className="hkg-body-editor" onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setDraftBody(event.target.value)} placeholder={t('inspector.descriptionPlaceholder')} value={draftBody} />
+              <Textarea autoFocus className="hkg-body-editor" onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setDraftBody(event.target.value)} onKeyDown={onEscape(cancelBody)} placeholder={t('inspector.descriptionPlaceholder')} value={draftBody} />
               <div className="hkg-inline-editor-actions">
-                <Button disabled={savingContent} onClick={() => { setDraftBody(task.body || ''); setEditingBody(false) }} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
+                <Button disabled={savingContent} onClick={cancelBody} size="xs" variant="ghost">{t('inspector.cancel')}</Button>
                 <Button disabled={savingContent} onClick={() => void saveBody()} size="xs" variant="primary">{savingContent ? <Loader size="xs" /> : t('inspector.save')}</Button>
               </div>
             </div>
@@ -666,18 +703,19 @@ export function Inspector({
             <p className="hkg-description">{task.result}</p>
           </section>
         )}
-        {latest && (
+        {latestSummary && (
           <section className="hkg-drawer-section">
             <div className="hkg-section-label">{t('inspector.latestSummary')}</div>
-            <p className="hkg-description">{latest}</p>
+            <p className="hkg-description">{latestSummary}</p>
           </section>
         )}
-        {(parents.length > 0 || children.length > 0 || hiddenLinks > 0) && (
+        {(parents.length > 0 || children.length > 0 || hiddenLinks > 0 || truncatedLinks > 0) && (
           <section className="hkg-drawer-section">
             <div className="hkg-section-label">{t('inspector.dependencies')}</div>
             <DependencySide label={t('inspector.blockedBy')} onSelect={onSelect} tasks={parents} />
             <DependencySide label={t('inspector.blocks')} onSelect={onSelect} tasks={children} />
             {hiddenLinks > 0 && <p className="hkg-drawer-muted hkg-hidden-note"><Codicon name="eye-closed" size="0.7rem" />{t('inspector.hiddenDeps', hiddenLinks)}</p>}
+            {truncatedLinks > 0 && <p className="hkg-drawer-muted hkg-hidden-note"><Codicon name="ellipsis" size="0.7rem" />{t('inspector.truncatedDeps', truncatedLinks)}</p>}
           </section>
         )}
         <section className="hkg-drawer-section">
@@ -693,7 +731,7 @@ export function Inspector({
             </div>
           )}
           <div className="hkg-comment-composer">
-            <Textarea onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setComment(event.target.value)} placeholder={t('inspector.commentPlaceholder')} value={comment} />
+            <Textarea onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setComment(event.target.value)} onKeyDown={onEscape(() => (document.activeElement as HTMLElement | null)?.blur())} placeholder={t('inspector.commentPlaceholder')} value={comment} />
             <Button disabled={savingComment || !comment.trim()} onClick={() => void addComment()} size="xs" variant="primary">
               {savingComment ? <Loader size="xs" /> : <Codicon name="send" size="0.7rem" />}{t('inspector.comment')}
             </Button>
@@ -703,7 +741,7 @@ export function Inspector({
           <section className="hkg-drawer-section">
             <div className="hkg-section-label">{t('inspector.activity')} <span>{events.length}</span></div>
             <div className="hkg-activity-list">
-              {events.slice(-8).reverse().map(event => (
+              {events.filter(event => event.kind !== 'heartbeat').slice(-8).reverse().map(event => (
                 <div key={event.id}><Codicon name="history" size="0.65rem" /><span>{event.kind.replaceAll('_', ' ')}</span><time>{new Date(event.created_at * 1000).toLocaleString()}</time></div>
               ))}
             </div>

@@ -72,7 +72,8 @@ const en = {
     open: (title: string) => `Open task details: ${title}`,
     hiddenDeps: (count: number) => `${count} link(s) to hidden (archived) tasks`,
     unmet: (count: number) => `Waiting on ${count} unfinished prerequisite(s)`,
-    links: (count: number) => `${count} dependency link(s)`
+    links: (count: number) => `${count} dependency link(s)`,
+    truncatedDeps: (count: number) => `${count} link(s) to tasks beyond the display limit`
   },
   canvas: {
     hint: 'Double-click canvas to fit',
@@ -92,8 +93,10 @@ const en = {
     notInitialized: 'This board has no database yet',
     notInitializedHint: 'It is created the first time a task is added in Kanban.',
     openKanban: 'Open Kanban',
-    truncated: (count: number) => `Showing the first ${count} tasks — filter to see the rest.`,
-    archivedHidden: (count: number) => `${count} archived hidden`
+    truncated: (shown: number, total: number) => `Showing the first ${shown} of ${total} tasks. Search and filters only cover these; links to the rest are counted on the cards.`,
+    archivedHidden: (count: number) => `${count} archived hidden`,
+    refreshing: 'Updating…',
+    kanbanDisabled: 'The Kanban page is turned off. Enable the “Kanban” plugin in Settings ▸ Plugins to open it.'
   },
   inspector: {
     label: 'Task details',
@@ -122,6 +125,8 @@ const en = {
     blockedBy: 'Blocked by',
     blocks: 'Blocks',
     hiddenDeps: (count: number) => `${count} more link(s) to archived tasks — enable “Show archived” to see them.`,
+    truncatedDeps: (count: number) => `${count} more link(s) to tasks beyond the display limit.`,
+    openKanbanOther: (name: string) => `Open Kanban (it shows board “${name}”, not this one)`,
     comments: 'Comments',
     commentPlaceholder: 'Add a comment…',
     comment: 'Comment',
@@ -137,7 +142,8 @@ const en = {
     commented: 'Comment added. The Kanban worker can see this note.',
     commentFailed: (error: string) => `Could not add comment: ${error}`,
     moved: (status: string) => `Task moved to ${status}.`,
-    moveFailed: (error: string) => `Could not change status: ${error}`
+    moveFailed: (error: string) => `Could not change status: ${error}`,
+    staleConnection: 'The connection changed. Reopen the task and try again.'
   }
 } satisfies Tree
 
@@ -209,7 +215,8 @@ const zh: Messages = {
     open: title => `打开任务详情：${title}`,
     hiddenDeps: count => `${count} 条依赖指向已隐藏（归档）的任务`,
     unmet: count => `等待 ${count} 个未完成的前置任务`,
-    links: count => `${count} 条依赖`
+    links: count => `${count} 条依赖`,
+    truncatedDeps: count => `${count} 条依赖指向超出显示上限的任务`
   },
   canvas: {
     hint: '双击画布适应窗口',
@@ -229,8 +236,10 @@ const zh: Messages = {
     notInitialized: '这个看板还没有数据库',
     notInitializedHint: '在看板中添加第一个任务时会自动创建。',
     openKanban: '打开看板',
-    truncated: count => `仅显示前 ${count} 个任务，请用筛选查看其余任务。`,
-    archivedHidden: count => `已隐藏 ${count} 个归档`
+    truncated: (shown, total) => `仅显示 ${total} 个任务中的前 ${shown} 个；搜索和筛选只作用于这些任务，指向其余任务的依赖在卡片上计数。`,
+    archivedHidden: count => `已隐藏 ${count} 个归档`,
+    refreshing: '正在更新…',
+    kanbanDisabled: '看板页面未启用。请在 设置 ▸ 插件 中启用“Kanban”插件后再打开。'
   },
   inspector: {
     label: '任务详情',
@@ -259,6 +268,8 @@ const zh: Messages = {
     blockedBy: '前置任务',
     blocks: '后续任务',
     hiddenDeps: count => `另有 ${count} 条依赖指向已归档任务 — 打开“显示已归档”即可查看。`,
+    truncatedDeps: count => `另有 ${count} 条依赖指向超出显示上限的任务。`,
+    openKanbanOther: name => `打开看板（显示的是「${name}」，不是当前看板）`,
     comments: '评论',
     commentPlaceholder: '添加评论…',
     comment: '评论',
@@ -274,7 +285,8 @@ const zh: Messages = {
     commented: '评论已添加，看板 worker 可以看到。',
     commentFailed: error => `无法添加评论：${error}`,
     moved: status => `任务已移到「${status}」。`,
-    moveFailed: error => `无法更改状态：${error}`
+    moveFailed: error => `无法更改状态：${error}`,
+    staleConnection: '连接已切换，请重新打开任务后再试。'
   }
 }
 

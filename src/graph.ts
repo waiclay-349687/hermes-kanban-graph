@@ -42,8 +42,34 @@ const STATUS_RANK: Record<string, number> = {
   blocked: 0, running: 1, review: 2, ready: 3, scheduled: 4, todo: 5, triage: 6, done: 7, archived: 8
 }
 
-export function statusTargets(current: string): string[] {
-  const targets: string[] = [...OPERATOR_STATUSES]
+/** Manual move matrix (`src -> allowed dst`), the `manual` field of core `GET /workflow`. */
+export type ManualMoves = Readonly<Record<string, readonly string[]>>
+
+/**
+ * Snapshot of core `kanban_workflow.DEFAULT_WORKFLOW.manual`, used only until
+ * the backend's `/workflow` answers (or when an older backend lacks it).
+ */
+export const DEFAULT_MANUAL_MOVES: ManualMoves = {
+  triage: ['ready', 'todo'],
+  todo: ['ready', 'scheduled', 'triage'],
+  scheduled: ['ready', 'todo', 'triage'],
+  ready: ['blocked', 'done', 'review', 'scheduled', 'todo', 'triage'],
+  running: ['blocked', 'done', 'ready', 'review', 'scheduled', 'todo', 'triage'],
+  blocked: ['done', 'ready', 'scheduled', 'todo', 'triage'],
+  review: ['done', 'ready', 'todo', 'triage'],
+  done: ['ready', 'todo', 'triage'],
+  archived: ['ready', 'todo', 'triage']
+}
+
+/**
+ * Menu entries for a task: the current status plus every operator-controlled
+ * status core accepts as a manual move from it. Archiving is always allowed
+ * (core never lists it). System-owned targets (scheduled, review) stay out.
+ */
+export function statusTargets(current: string, manual: ManualMoves = DEFAULT_MANUAL_MOVES): string[] {
+  const allowed = new Set(manual[current] ?? [])
+  const targets: string[] = OPERATOR_STATUSES.filter(status =>
+    status === current || (status === 'archived' ? current !== 'archived' : allowed.has(status)))
   if (!targets.includes(current)) {
     const currentIndex = TASK_STATUSES.indexOf(current as (typeof TASK_STATUSES)[number])
     const insertAt = TASK_STATUSES.slice(0, Math.max(0, currentIndex)).filter(status => targets.includes(status)).length
@@ -82,6 +108,9 @@ export interface GraphTask {
   created_by?: string | null
   hidden_parent_count?: number
   hidden_child_count?: number
+  /** Links to tasks cut by the server's node cap (not archived). */
+  truncated_parent_count?: number
+  truncated_child_count?: number
 }
 
 export interface TaskComment {
@@ -119,6 +148,17 @@ export interface GraphPayload {
   edges: GraphLink[]
   archived_count?: number
   truncated?: boolean
+  /** Tasks the server matched before applying its node cap. */
+  total_count?: number
+}
+
+/**
+ * `select` for the graph query. `latest_event_id` moves on every worker
+ * heartbeat; dropping it lets React Query's structural sharing keep an
+ * unchanged board the same object, so nothing downstream re-runs.
+ */
+export function stripEventCursor(payload: GraphPayload): GraphPayload {
+  return { ...payload, board: { ...payload.board, latest_event_id: 0 } }
 }
 
 export interface SectionData extends Record<string, unknown> {
@@ -130,7 +170,11 @@ export interface SectionData extends Record<string, unknown> {
 export type TaskNode = Node<GraphTask, 'task'>
 export type SectionNode = Node<SectionData, 'section'>
 export type GraphNode = SectionNode | TaskNode
-export type PositionOverrides = Record<string, XYPosition>
+/** `linked` records which region the card was in when dragged (absent on 0.2 entries). */
+export interface SavedPosition extends XYPosition {
+  linked?: boolean
+}
+export type PositionOverrides = Record<string, SavedPosition>
 
 export const NODE_WIDTH = 272
 export const NODE_HEIGHT = 104
@@ -150,36 +194,145 @@ export interface LayoutOptions {
   hideImplied?: boolean
 }
 
-const IMPLIED_EDGE_LIMIT = 4_000
+/**
+ * Strongly connected components (iterative Tarjan). Components are numbered in
+ * completion order, which is reverse topological: every successor component of
+ * `c` has a smaller number than `c`.
+ */
+function stronglyConnected(children: readonly number[][]): { comp: Int32Array; count: number; size: Int32Array } {
+  const n = children.length
+  const comp = new Int32Array(n).fill(-1)
+  const index = new Int32Array(n).fill(-1)
+  const low = new Int32Array(n)
+  const onStack = new Uint8Array(n)
+  const stack: number[] = []
+  const sizes: number[] = []
+  let counter = 0
+  for (let root = 0; root < n; root++) {
+    if (index[root] !== -1) continue
+    const work: [number, number][] = [[root, 0]]
+    index[root] = low[root] = counter++
+    stack.push(root)
+    onStack[root] = 1
+    while (work.length > 0) {
+      const frame = work[work.length - 1]!
+      const [v, next] = frame
+      if (next < children[v]!.length) {
+        frame[1] = next + 1
+        const w = children[v]![next]!
+        if (index[w] === -1) {
+          index[w] = low[w] = counter++
+          stack.push(w)
+          onStack[w] = 1
+          work.push([w, 0])
+        } else if (onStack[w]) {
+          low[v] = Math.min(low[v]!, index[w]!)
+        }
+        continue
+      }
+      work.pop()
+      if (work.length > 0) {
+        const parent = work[work.length - 1]![0]
+        low[parent] = Math.min(low[parent]!, low[v]!)
+      }
+      if (low[v] === index[v]) {
+        const id = sizes.length
+        let size = 0
+        let w: number
+        do {
+          w = stack.pop()!
+          onStack[w] = 0
+          comp[w] = id
+          size++
+        } while (w !== v)
+        sizes.push(size)
+      }
+    }
+  }
+  return { comp, count: sizes.length, size: Int32Array.from(sizes) }
+}
+
+/** Plain search for one edge, used only around cycles (legacy/manual corruption). */
+function impliedBySearch(children: readonly number[][], source: number, target: number): boolean {
+  const visited = new Set<number>([source])
+  const stack = children[source]!.filter(next => next !== target)
+  while (stack.length > 0) {
+    const id = stack.pop()!
+    if (visited.has(id)) continue
+    visited.add(id)
+    for (const next of children[id]!) {
+      if (next === target) return true
+      if (!visited.has(next)) stack.push(next)
+    }
+  }
+  return false
+}
 
 /**
  * Ids of links a→c that are implied by another path a→…→c. Read-only display
- * aid: Kanban still stores and enforces every link. Tolerates cycles (legacy or
- * manual corruption) via visited sets; skipped on very large graphs.
+ * aid: Kanban still stores and enforces every link.
+ *
+ * Reachability is computed once over the component DAG with bitsets, so the
+ * cost is O((V + E) · V / 32) instead of one graph search per edge, and there
+ * is no edge-count cliff. Edges touching a cycle fall back to a per-edge
+ * search, which keeps the old cycle semantics without risking non-termination.
  */
 export function impliedEdgeIds(edges: readonly GraphLink[]): Set<string> {
   const implied = new Set<string>()
-  if (edges.length > IMPLIED_EDGE_LIMIT) return implied
-  const children = new Map<string, string[]>()
-  for (const edge of edges) {
-    const list = children.get(edge.source)
-    if (list) list.push(edge.target)
-    else children.set(edge.source, [edge.target])
+  const indexOf = new Map<string, number>()
+  const key = (id: string) => {
+    let value = indexOf.get(id)
+    if (value === undefined) {
+      value = indexOf.size
+      indexOf.set(id, value)
+    }
+    return value
   }
-  for (const edge of edges) {
-    const visited = new Set<string>([edge.source])
-    const stack = (children.get(edge.source) ?? []).filter(next => next !== edge.target)
-    let found = false
-    while (stack.length > 0 && !found) {
-      const id = stack.pop()!
-      if (visited.has(id)) continue
-      visited.add(id)
-      for (const next of children.get(id) ?? []) {
-        if (next === edge.target) { found = true; break }
-        if (!visited.has(next)) stack.push(next)
+  const links = edges.map(edge => ({ id: edge.id, source: key(edge.source), target: key(edge.target) }))
+  const children: number[][] = Array.from({ length: indexOf.size }, () => [])
+  for (const link of links) if (link.source !== link.target) children[link.source]!.push(link.target)
+
+  const { comp, count, size } = stronglyConnected(children)
+  const words = Math.ceil(count / 32)
+  // reach[c] = components strictly reachable from component c (never c itself).
+  const reach = new Uint32Array(count * words)
+  const members: number[][] = Array.from({ length: count }, () => [])
+  for (let v = 0; v < children.length; v++) members[comp[v]!]!.push(v)
+  for (let c = 0; c < count; c++) {
+    const row = c * words
+    for (const v of members[c]!) {
+      for (const w of children[v]!) {
+        const d = comp[w]!
+        if (d === c) continue
+        const from = d * words
+        for (let i = 0; i < words; i++) reach[row + i] |= reach[from + i]
+        reach[row + (d >>> 5)] |= 1 << (d & 31)
       }
     }
-    if (found) implied.add(edge.id)
+  }
+
+  const bySource = new Map<number, typeof links>()
+  for (const link of links) {
+    if (link.source === link.target) continue
+    const list = bySource.get(link.source)
+    if (list) list.push(link)
+    else bySource.set(link.source, [link])
+  }
+  const union = new Uint32Array(words)
+  for (const [source, outgoing] of bySource) {
+    union.fill(0)
+    for (const child of children[source]!) {
+      const from = comp[child]! * words
+      for (let i = 0; i < words; i++) union[i] |= reach[from + i]
+    }
+    const sourceInCycle = size[comp[source]!]! > 1
+    for (const link of outgoing) {
+      const target = comp[link.target]!
+      const found = sourceInCycle || size[target]! > 1
+        ? impliedBySearch(children, source, link.target)
+        : (union[target >>> 5]! & (1 << (target & 31))) !== 0
+      if (found) implied.add(link.id)
+    }
   }
   return implied
 }
@@ -212,54 +365,88 @@ function taskNode(task: GraphTask, direction: LayoutDirection, position: XYPosit
   } as TaskNode
 }
 
+/** Which links are drawn, which are implied, and which tasks Dagre must place. */
+export interface LayoutPlan {
+  implied: Set<string>
+  shownEdges: GraphLink[]
+  linkedIds: string[]
+  /** Identity of the Dagre input: changes only when the linked structure does. */
+  structureKey: string
+}
+
+export function planLayout(payload: GraphPayload, hideImplied = false, direction: LayoutDirection = 'LR'): LayoutPlan {
+  const implied = impliedEdgeIds(payload.edges)
+  const shownEdges = hideImplied ? payload.edges.filter(edge => !implied.has(edge.id)) : payload.edges
+  const linkedSet = new Set<string>()
+  for (const edge of shownEdges) {
+    linkedSet.add(edge.source)
+    linkedSet.add(edge.target)
+  }
+  const linkedIds = payload.nodes.filter(task => linkedSet.has(task.id)).map(task => task.id)
+  const backbone = shownEdges.filter(edge => !implied.has(edge.id)).map(edge => edge.id)
+  return { implied, shownEdges, linkedIds, structureKey: [direction, linkedIds.join('\u0001'), backbone.join('\u0001')].join('\u0002') }
+}
+
+/** Dagre output for the linked tasks, reusable while `structureKey` holds. */
+export interface LinkedLayout {
+  structureKey: string
+  positions: Map<string, XYPosition>
+  minX: number
+  maxX: number
+  maxY: number
+}
+
+export function layoutLinked(plan: LayoutPlan, direction: LayoutDirection): LinkedLayout {
+  const positions = new Map<string, XYPosition>()
+  if (plan.linkedIds.length === 0) {
+    return { structureKey: plan.structureKey, positions, minX: MARGIN, maxX: MARGIN, maxY: MARGIN - SECTION_GAP }
+  }
+  const graph = new dagre.graphlib.Graph()
+  graph.setDefaultEdgeLabel(() => ({}))
+  graph.setGraph({ rankdir: direction, ranksep: 88, nodesep: 34, edgesep: 20, marginx: MARGIN, marginy: MARGIN })
+  for (const id of plan.linkedIds) graph.setNode(id, { width: NODE_WIDTH, height: NODE_HEIGHT })
+  // Implied links barely constrain rank order; keep them out of Dagre so the
+  // backbone path drives the layout and fewer edges cross.
+  for (const edge of plan.shownEdges) if (!plan.implied.has(edge.id)) graph.setEdge(edge.source, edge.target)
+  dagre.layout(graph)
+  let minX = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxY = Number.NEGATIVE_INFINITY
+  for (const id of plan.linkedIds) {
+    const point = graph.node(id) as { x: number; y: number }
+    const position = { x: point.x - NODE_WIDTH / 2, y: point.y - NODE_HEIGHT / 2 }
+    minX = Math.min(minX, position.x)
+    maxX = Math.max(maxX, position.x + NODE_WIDTH)
+    maxY = Math.max(maxY, position.y + NODE_HEIGHT)
+    positions.set(id, position)
+  }
+  return { structureKey: plan.structureKey, positions, minX, maxX, maxY }
+}
+
 /**
  * Dagre lays out only tasks that take part in a dependency. Unlinked tasks are
  * not dropped: they go into a separate, collapsible grid under the DAG so a
  * board made mostly of independent cards stays readable instead of becoming
  * one very tall Dagre rank.
+ *
+ * Pass a precomputed `plan` / `linkedLayout` to skip the expensive phases when
+ * only task data (status, title, summary) changed.
  */
 export function layoutGraph(
   payload: GraphPayload,
   direction: LayoutDirection,
   edgeStyle: EdgeStyle = 'elbow',
   motion = true,
-  options: LayoutOptions = {}
+  options: LayoutOptions & { plan?: LayoutPlan; linkedLayout?: LinkedLayout } = {}
 ): LayoutResult {
-  const implied = impliedEdgeIds(payload.edges)
-  const shownEdges = options.hideImplied ? payload.edges.filter(edge => !implied.has(edge.id)) : payload.edges
-  const linkedIds = new Set<string>()
-  for (const edge of shownEdges) {
-    linkedIds.add(edge.source)
-    linkedIds.add(edge.target)
-  }
+  const plan = options.plan ?? planLayout(payload, options.hideImplied, direction)
+  const { implied, shownEdges } = plan
+  const linkedLayout = options.linkedLayout?.structureKey === plan.structureKey ? options.linkedLayout : layoutLinked(plan, direction)
+  const linkedIds = new Set(plan.linkedIds)
   const linked = payload.nodes.filter(task => linkedIds.has(task.id))
   const unlinked = payload.nodes.filter(task => !linkedIds.has(task.id)).sort(compareUnlinked)
-  const nodes: GraphNode[] = []
-
-  let minX = MARGIN
-  let maxX = MARGIN
-  let maxY = MARGIN - SECTION_GAP
-  if (linked.length > 0) {
-    const graph = new dagre.graphlib.Graph()
-    graph.setDefaultEdgeLabel(() => ({}))
-    graph.setGraph({ rankdir: direction, ranksep: 88, nodesep: 34, edgesep: 20, marginx: MARGIN, marginy: MARGIN })
-    for (const task of linked) graph.setNode(task.id, { width: NODE_WIDTH, height: NODE_HEIGHT })
-    // Implied links barely constrain rank order; keep them out of Dagre so the
-    // backbone path drives the layout and fewer edges cross.
-    for (const edge of shownEdges) if (!implied.has(edge.id)) graph.setEdge(edge.source, edge.target)
-    dagre.layout(graph)
-    minX = Number.POSITIVE_INFINITY
-    maxX = Number.NEGATIVE_INFINITY
-    maxY = Number.NEGATIVE_INFINITY
-    for (const task of linked) {
-      const point = graph.node(task.id) as { x: number; y: number }
-      const position = { x: point.x - NODE_WIDTH / 2, y: point.y - NODE_HEIGHT / 2 }
-      minX = Math.min(minX, position.x)
-      maxX = Math.max(maxX, position.x + NODE_WIDTH)
-      maxY = Math.max(maxY, position.y + NODE_HEIGHT)
-      nodes.push(taskNode(task, direction, position, true))
-    }
-  }
+  const nodes: GraphNode[] = linked.map(task => taskNode(task, direction, linkedLayout.positions.get(task.id)!, true))
+  const { minX, maxX, maxY } = linkedLayout
 
   if (unlinked.length > 0) {
     const cell = NODE_WIDTH + GRID_GAP_X
@@ -318,12 +505,86 @@ function validPosition(position: XYPosition | undefined): position is XYPosition
   return Boolean(position && Number.isFinite(position.x) && Number.isFinite(position.y))
 }
 
+/**
+ * A manual position only applies while the task keeps the linked/unlinked
+ * role it had when dragged: a card that joins or leaves the DAG moves to a
+ * different region, and its old spot would overlap freshly laid-out cards.
+ * Entries without `linked` (saved before 0.3) are treated as linked.
+ */
 export function applyPositionOverrides<T extends GraphNode>(nodes: T[], overrides: PositionOverrides): T[] {
   return nodes.map(node => {
     if (node.type !== 'task') return node
-    const position = overrides[node.id]
-    return validPosition(position) ? { ...node, position } : node
+    const saved = overrides[node.id]
+    if (!validPosition(saved) || (saved.linked ?? true) !== Boolean(node.data._linked)) return node
+    return { ...node, position: { x: saved.x, y: saved.y } }
   })
+}
+
+/** Saved positions per layout context (`[scope:]board:direction`), newest use first to survive the cap. */
+export interface PositionStore {
+  [context: string]: { at: number; positions: PositionOverrides }
+}
+
+export const MAX_SAVED_POSITIONS = 3_000
+
+function parsePositions(raw: unknown): PositionOverrides {
+  const positions: PositionOverrides = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return positions
+  for (const [taskId, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const { x, y, linked } = value as { x?: unknown; y?: unknown; linked?: unknown }
+    if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) continue
+    positions[taskId] = typeof linked === 'boolean' ? { x, y, linked } : { x, y }
+  }
+  return positions
+}
+
+/**
+ * Reads the current store shape, or migrates the 0.2 shape
+ * (`{ context: { taskId: {x, y} } }`) with every context at time 0.
+ */
+export function parsePositionStore(raw: unknown): PositionStore {
+  const store: PositionStore = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return store
+  for (const [context, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const entry = value as { at?: unknown; positions?: unknown }
+    const current = typeof entry.at === 'number' && entry.positions && typeof entry.positions === 'object'
+    const positions = parsePositions(current ? entry.positions : value)
+    if (Object.keys(positions).length > 0) store[context] = { at: current ? entry.at as number : 0, positions }
+  }
+  return store
+}
+
+/** Drops whole contexts, least recently used first, until at most `max` positions remain. */
+export function capPositionStore(store: PositionStore, max = MAX_SAVED_POSITIONS): PositionStore {
+  const contexts = Object.entries(store).sort(([, a], [, b]) => b.at - a.at)
+  const next: PositionStore = {}
+  let total = 0
+  for (const [context, entry] of contexts) {
+    const size = Object.keys(entry.positions).length
+    if (total > 0 && total + size > max) continue
+    next[context] = entry
+    total += size
+  }
+  return next
+}
+
+export function savePosition(store: PositionStore, context: string, id: string, position: SavedPosition, now = Date.now()): PositionStore {
+  const positions = { ...(store[context]?.positions ?? {}), [id]: position }
+  return capPositionStore({ ...store, [context]: { at: now, positions } })
+}
+
+/** Removes positions of tasks no longer on the board; returns `store` itself when nothing changed. */
+export function prunePositions(store: PositionStore, context: string, liveIds: ReadonlySet<string>): PositionStore {
+  const entry = store[context]
+  if (!entry) return store
+  const kept = Object.entries(entry.positions).filter(([id]) => liveIds.has(id))
+  if (kept.length === Object.keys(entry.positions).length) return store
+  const next = { ...store }
+  if (kept.length === 0) delete next[context]
+  else next[context] = { at: entry.at, positions: Object.fromEntries(kept) }
+  return next
 }
 
 export function updatePositionOverrides(
@@ -404,6 +665,17 @@ export function unmetParentCounts(payload: GraphPayload): Map<string, number> {
   return counts
 }
 
+// ── connection scope ─────────────────────────────────────────────────────────
+
+/**
+ * Whether a query keyed `['kanban-graph', version, scope, ...]` may fetch now.
+ * `routed` is the connection a request issued now would reach (`null` when the
+ * host cannot tell, which disables the gate).
+ */
+export function keyInRoutedScope(queryKey: readonly unknown[], routed: null | string): boolean {
+  return routed === null || queryKey[2] === routed
+}
+
 // ── board selection ──────────────────────────────────────────────────────────
 
 /** Sentinel selection: show whatever board the bundled Kanban page shows. */
@@ -430,6 +702,28 @@ export function resolveBoardSelection({ boards, kanbanSlug, selection, serverCur
 /** localStorage key the bundled Kanban plugin persists its selected board under. */
 export function kanbanBoardStorageKey(scope: string): string {
   return scope === 'local' ? 'hermes.plugin.kanban.boardSlug' : `hermes.plugin.kanban.boardSlug.${scope}`
+}
+
+/** localStorage key of the Desktop's explicit plugin enable/disable choices. */
+export const PLUGIN_DECISIONS_KEY = 'hermes.desktop.pluginDecisions.v2'
+
+/**
+ * Whether core Kanban's page is registered. Core ships `defaultEnabled: false`,
+ * so only an explicit `true` choice enables it; without that `/kanban` is not
+ * a route and the router would read it as a session id.
+ */
+export function coreKanbanEnabled(rawDecisions: null | string): boolean {
+  if (rawDecisions === null) return false
+  try {
+    return kanbanEnabledIn(JSON.parse(rawDecisions))
+  } catch {
+    return false
+  }
+}
+
+/** Same rule over the decoded decisions (`host.pluginDecisions.get()`). */
+export function kanbanEnabledIn(decisions: unknown): boolean {
+  return Boolean(decisions && typeof decisions === 'object' && (decisions as Record<string, unknown>).kanban === true)
 }
 
 export function parseStoredSlug(raw: null | string): string {

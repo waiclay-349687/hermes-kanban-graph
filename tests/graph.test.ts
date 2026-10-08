@@ -8,7 +8,18 @@ import { LOCALES } from '../src/i18n'
 
 import {
   applyPositionOverrides,
+  capPositionStore,
   connectionActivity,
+  coreKanbanEnabled,
+  DEFAULT_MANUAL_MOVES,
+  kanbanEnabledIn,
+  keyInRoutedScope,
+  layoutLinked,
+  parsePositionStore,
+  planLayout,
+  prunePositions,
+  savePosition,
+  stripEventCursor,
   filterGraph,
   impliedEdgeIds,
   FOLLOW_KANBAN,
@@ -28,12 +39,36 @@ import {
   type GraphPayload
 } from '../src/graph'
 
+const coreWorkflow = join(homedir(), '.hermes/hermes-agent/hermes_cli/kanban_workflow.py')
+
 describe('statusTargets', () => {
-  it('offers operator-controlled states and keeps the current system state visible', () => {
-    expect(statusTargets('todo')).toEqual(['triage', 'todo', 'ready', 'blocked', 'done', 'archived'])
+  it('offers only moves the core manual matrix accepts, plus archive', () => {
+    expect(statusTargets('todo')).toEqual(['triage', 'todo', 'ready', 'archived'])
+    expect(statusTargets('triage')).toEqual(['triage', 'todo', 'ready', 'archived'])
     expect(statusTargets('running')).toEqual(['triage', 'todo', 'ready', 'running', 'blocked', 'done', 'archived'])
-    expect(statusTargets('review')).toContain('review')
-    expect(statusTargets('scheduled')).toContain('scheduled')
+    expect(statusTargets('done')).toEqual(['triage', 'todo', 'ready', 'done', 'archived'])
+    expect(statusTargets('archived')).toEqual(['triage', 'todo', 'ready', 'archived'])
+  })
+
+  it('keeps the current system state visible', () => {
+    expect(statusTargets('review')).toEqual(['triage', 'todo', 'ready', 'review', 'done', 'archived'])
+    expect(statusTargets('scheduled')).toEqual(['triage', 'todo', 'scheduled', 'ready', 'archived'])
+  })
+
+  it('follows the matrix the backend serves', () => {
+    expect(statusTargets('todo', { todo: ['done'] })).toEqual(['todo', 'done', 'archived'])
+    expect(statusTargets('unknown', {})).toEqual(['unknown', 'archived'])
+  })
+
+  it.skipIf(!existsSync(coreWorkflow))('ships a fallback identical to core DEFAULT_WORKFLOW.manual', () => {
+    const source = readFileSync(coreWorkflow, 'utf8')
+    for (const [src, targets] of Object.entries(DEFAULT_MANUAL_MOVES)) {
+      const key = src === 'archived' ? 'ARCHIVED' : `"${src}"`
+      const line = source.split('\n').find(row => row.trim().startsWith(`${key}: (`))
+      expect(line, src).toBeDefined()
+      const listed = [...line!.matchAll(/"([a-z]+)"/g)].map(match => match[1]).filter(name => name !== src)
+      expect([...listed].sort(), src).toEqual([...targets].sort())
+    }
   })
 })
 
@@ -345,5 +380,157 @@ describe('implied links', () => {
     const hidden = layoutGraph(chain, 'LR', 'elbow', true, { hideImplied: true })
     expect(hidden.edges.map(edge => edge.id).sort()).toEqual(['a->b', 'b->c', 'c->d'])
     expect(hidden.nodes.filter(isTaskNode)).toHaveLength(4)
+  })
+})
+
+describe('implied links at scale', () => {
+  const bruteForce = (edges: { id: string; source: string; target: string }[]) => {
+    const children = new Map<string, string[]>()
+    for (const edge of edges) children.set(edge.source, [...(children.get(edge.source) ?? []), edge.target])
+    const implied = new Set<string>()
+    for (const edge of edges) {
+      const seen = new Set<string>([edge.source])
+      const stack = (children.get(edge.source) ?? []).filter(next => next !== edge.target)
+      let found = false
+      while (stack.length > 0 && !found) {
+        const id = stack.pop()!
+        if (seen.has(id)) continue
+        seen.add(id)
+        for (const next of children.get(id) ?? []) {
+          if (next === edge.target) found = true
+          else if (!seen.has(next)) stack.push(next)
+        }
+      }
+      if (found) implied.add(edge.id)
+    }
+    return implied
+  }
+
+  it('matches a per-edge search on random DAGs and cyclic graphs', () => {
+    let seed = 7
+    const random = () => (seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648) / 2_147_483_648
+    for (let round = 0; round < 40; round++) {
+      const size = 3 + Math.floor(random() * 30)
+      const edges = new Map<string, { id: string; source: string; target: string }>()
+      for (let i = 0; i < size * 2; i++) {
+        let a = Math.floor(random() * size)
+        let b = Math.floor(random() * size)
+        if (a === b) continue
+        // Mostly forward edges; a few back edges make cycles in odd rounds.
+        if (a > b && (round % 2 === 0 || random() < 0.8)) [a, b] = [b, a]
+        const id = `n${a}->n${b}`
+        edges.set(id, { id, source: `n${a}`, target: `n${b}` })
+      }
+      const list = [...edges.values()]
+      expect([...impliedEdgeIds(list)].sort(), `round ${round}`).toEqual([...bruteForce(list)].sort())
+    }
+  })
+
+  it('has no edge-count cliff: a 6,000-edge fan-out is still reduced', () => {
+    const edges = []
+    for (let i = 0; i < 3_000; i++) {
+      edges.push({ id: `root->m${i}`, source: 'root', target: `m${i}` })
+      edges.push({ id: `m${i}->leaf`, source: `m${i}`, target: 'leaf' })
+    }
+    edges.push({ id: 'root->leaf', source: 'root', target: 'leaf' })
+    const started = performance.now()
+    const implied = impliedEdgeIds(edges)
+    expect(implied).toEqual(new Set(['root->leaf']))
+    expect(performance.now() - started).toBeLessThan(1_000)
+  })
+})
+
+describe('layout reuse', () => {
+  it('drops the moving event cursor so unchanged boards compare equal', () => {
+    const a = stripEventCursor({ ...payload, board: { slug: 'default', latest_event_id: 1 } })
+    const b = stripEventCursor({ ...payload, board: { slug: 'default', latest_event_id: 99 } })
+    expect(a).toEqual(b)
+    expect(a.board.latest_event_id).toBe(0)
+  })
+
+  it('keeps the structure key when only task data changes', () => {
+    const before = planLayout(payload, false, 'LR')
+    const changed = { ...payload, nodes: payload.nodes.map(node => ({ ...node, status: 'running', title: `${node.title}!` })) }
+    expect(planLayout(changed, false, 'LR').structureKey).toBe(before.structureKey)
+    expect(planLayout(payload, false, 'TB').structureKey).not.toBe(before.structureKey)
+    const relinked = { ...payload, edges: [...payload.edges, { id: 'child-a->isolated', source: 'child-a', target: 'isolated' }] }
+    expect(planLayout(relinked, false, 'LR').structureKey).not.toBe(before.structureKey)
+  })
+
+  it('reuses a cached Dagre layout for the same structure', () => {
+    const plan = planLayout(payload, false, 'LR')
+    const cached = layoutLinked(plan, 'LR')
+    cached.positions.set('root', { x: -500, y: -500 })
+    const result = layoutGraph(payload, 'LR', 'elbow', true, { plan, linkedLayout: cached })
+    expect(result.nodes.find(node => node.id === 'root')!.position).toEqual({ x: -500, y: -500 })
+    const stale = { ...cached, structureKey: 'other' }
+    expect(layoutGraph(payload, 'LR', 'elbow', true, { plan, linkedLayout: stale }).nodes.find(node => node.id === 'root')!.position)
+      .not.toEqual({ x: -500, y: -500 })
+  })
+})
+
+describe('saved positions', () => {
+  it('applies a position only while the task keeps its linked role', () => {
+    const nodes = layoutGraph(payload, 'LR').nodes
+    const moved = applyPositionOverrides(nodes, {
+      root: { x: 1, y: 2, linked: true },
+      isolated: { x: 3, y: 4, linked: true },
+      'child-a': { x: 5, y: 6 }
+    })
+    const byId = new Map(moved.map(node => [node.id, node.position]))
+    expect(byId.get('root')).toEqual({ x: 1, y: 2 })
+    expect(byId.get('isolated')).not.toEqual({ x: 3, y: 4 })
+    // 0.2 entries without `linked` count as linked.
+    expect(byId.get('child-a')).toEqual({ x: 5, y: 6 })
+  })
+
+  it('migrates the 0.2 shape and drops junk', () => {
+    const store = parsePositionStore({
+      'default:LR': { root: { x: 1, y: 2 }, bad: { x: 'no', y: 1 } },
+      'life:TB': { at: 5, positions: { a: { x: 0, y: 0, linked: false } } },
+      broken: 3
+    })
+    expect(store).toEqual({
+      'default:LR': { at: 0, positions: { root: { x: 1, y: 2 } } },
+      'life:TB': { at: 5, positions: { a: { x: 0, y: 0, linked: false } } }
+    })
+  })
+
+  it('prunes gone tasks and caps total storage by least recent context', () => {
+    let store = savePosition({}, 'old', 'a', { x: 0, y: 0, linked: true }, 1)
+    store = savePosition(store, 'old', 'b', { x: 0, y: 0, linked: true }, 2)
+    store = savePosition(store, 'new', 'c', { x: 1, y: 1, linked: false }, 3)
+    expect(prunePositions(store, 'old', new Set(['a', 'b']))).toBe(store)
+    expect(prunePositions(store, 'old', new Set(['a'])).old!.positions).toEqual({ a: { x: 0, y: 0, linked: true } })
+    expect(prunePositions(store, 'new', new Set())).not.toHaveProperty('new')
+    expect(Object.keys(capPositionStore(store, 2))).toEqual(['new'])
+    expect(Object.keys(capPositionStore(store, 3)).sort()).toEqual(['new', 'old'])
+  })
+})
+
+describe('core Kanban availability', () => {
+  it('treats only an explicit enable as a registered /kanban route', () => {
+    expect(coreKanbanEnabled(null)).toBe(false)
+    expect(coreKanbanEnabled('{"kanban":true}')).toBe(true)
+    expect(coreKanbanEnabled('{"kanban":false}')).toBe(false)
+    expect(coreKanbanEnabled('{}')).toBe(false)
+    expect(coreKanbanEnabled('{broken')).toBe(false)
+    expect(kanbanEnabledIn({ kanban: true })).toBe(true)
+    expect(kanbanEnabledIn(Object.freeze({ other: true }))).toBe(false)
+    expect(kanbanEnabledIn(undefined)).toBe(false)
+  })
+})
+
+describe('connection scope gate', () => {
+  const key = ['kanban-graph', 3, 'work-mac', 'graph', 'default', false] as const
+
+  it('fetches only while the key scope is the routed connection', () => {
+    expect(keyInRoutedScope(key, 'work-mac')).toBe(true)
+    expect(keyInRoutedScope(key, 'local')).toBe(false)
+    expect(keyInRoutedScope(['kanban-graph', 3, 'local', 'boards'], 'local')).toBe(true)
+  })
+
+  it('stays open on hosts that cannot report the routed connection', () => {
+    expect(keyInRoutedScope(key, null)).toBe(true)
   })
 })

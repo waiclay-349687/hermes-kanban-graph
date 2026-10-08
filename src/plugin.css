@@ -41,6 +41,10 @@
 .hkg-stat { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-tertiary); font-size: 10px; white-space: nowrap; }
 .hkg-stat > span { color: var(--ui-text-quaternary); }
 .hkg-board-switcher { width: min(220px, 28vw); justify-content: center !important; }
+.hkg-refreshing { display: inline-flex; align-items: center; gap: 5px; color: var(--ui-text-tertiary); font-size: 10px; white-space: nowrap; }
+.hkg-state-note { max-width: 360px; margin: 0; text-align: center; font-size: 11px; }
+
+.hkg-canvas-refreshing .react-flow__viewport { opacity: 0.72; transition: opacity 120ms ease; }
 
 .hkg-canvas {
   position: relative;
