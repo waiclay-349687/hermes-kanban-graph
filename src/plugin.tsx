@@ -40,43 +40,65 @@ import {
 } from 'react'
 
 import {
+  ALL_BOARDS,
   applyPositionOverrides,
+  boardSelectionStorageKey,
   coreKanbanEnabled,
+  decorateGraph,
   DEFAULT_MANUAL_MOVES,
   EMPTY_FILTERS,
   filterGraph,
   FOLLOW_KANBAN,
+  isBandId,
+  isSectionId,
   isTaskNode,
   kanbanBoardStorageKey,
   kanbanEnabledIn,
   keyInRoutedScope,
+  layoutBoards,
   layoutGraph,
   layoutLinked,
+  nodeKey,
+  parseBoardSelection,
   parsePositionStore,
   parseStoredSlug,
   planLayout,
   PLUGIN_DECISIONS_KEY,
+  positionContextFor,
   prunePositions,
   resolveBoardSelection,
   savePosition,
+  splitAllBoards,
   statusBreakdown,
   statusMeta,
   statusTargets,
   stripEventCursor,
   summarizeGraph,
-  UNLINKED_SECTION_ID,
-  unmetParentCounts,
+  type BoardSlice,
   type GraphFilters,
   type GraphNode,
   type GraphPayload,
   type GraphTask,
+  type LinkedLayout,
   type ManualMoves,
   type PositionOverrides,
   type PositionStore,
   type TaskDetail
 } from './graph'
 import { LOCALES } from './i18n'
-import { coalesce, EventCursors, eventsPath, frameEffect, graphPollMs, LIVE_COALESCE_MS, LIVE_LEASE_MS, touchesTask, type FrameEffect } from './live'
+import {
+  allSocketsLive,
+  coalesce,
+  EventCursors,
+  eventsPath,
+  frameEffect,
+  graphPollMs,
+  LIVE_COALESCE_MS,
+  LIVE_LEASE_MS,
+  liveSocketBoards,
+  touchesTask,
+  type FrameEffect
+} from './live'
 import pluginCss from './plugin.css'
 import {
   BoardSwitcher,
@@ -138,8 +160,6 @@ function errText(error: unknown): string {
   }
   return raw
 }
-
-const scopedKey = (key: string, scope: string) => (scope === LOCAL_SCOPE ? key : `${key}.${scope}`)
 
 // ── connection scope ─────────────────────────────────────────────────────────
 //
@@ -213,8 +233,7 @@ function loadViewSettings(): ViewSettings {
 }
 
 function loadBoardSelection(scope: string): string {
-  const saved = pluginStorage?.get<unknown>(scopedKey('board-selection', scope), FOLLOW_KANBAN)
-  return typeof saved === 'string' && saved ? saved : FOLLOW_KANBAN
+  return parseBoardSelection(pluginStorage?.get<unknown>(boardSelectionStorageKey(scope), FOLLOW_KANBAN))
 }
 
 const loadPositionStore = (): PositionStore => parsePositionStore(pluginStorage?.get<unknown>('node-positions', {}))
@@ -395,62 +414,90 @@ function closeLiveSockets(): void {
   eventCursors.clear()
 }
 
-/** Opens the board's event socket once the board's database exists and
- *  returns whether a frame (the hello or an event) arrived on it. */
-function useLiveEvents(scope: string, board: string, enabled: boolean, onFrame: (effect: FrameEffect) => void): boolean {
-  const key = enabled && board ? `${scope}\u0000${board}` : ''
-  const [liveKey, setLiveKey] = useState('')
-  const [reopen, setReopen] = useState(0)
+const NO_BOARDS: readonly string[] = []
+
+/** Opens one event socket per listed board (each with an existing database and
+ *  a snapshot cursor; the all-boards view lists up to `MAX_LIVE_SOCKETS`, above
+ *  that none) and returns whether every one of them holds its live lease. */
+function useLiveEvents(scope: string, boards: readonly string[], onFrame: (board: string, effect: FrameEffect) => void): boolean {
+  const targets = liveSocketBoards(boards)
+  const boardsKey = targets.join('\u0001')
+  const sessionKey = boardsKey ? `${scope}\u0000${boardsKey}` : ''
+  const [liveState, setLiveState] = useState<{ key: string; live: ReadonlySet<string> }>({ key: '', live: new Set() })
   const onFrameRef = useRef(onFrame)
-  useEffect(() => {
-    if (!key) return
-    const onReopen = (event: Event) => {
-      if ((event as CustomEvent<string>).detail === key) setReopen(n => n + 1)
-    }
-    socketReopen.addEventListener('reopen', onReopen)
-    return () => socketReopen.removeEventListener('reopen', onReopen)
-  }, [key])
   useEffect(() => {
     onFrameRef.current = onFrame
   }, [onFrame])
   useEffect(() => {
     const dial = openSocket
-    if (!key || !dial) return
+    if (!sessionKey || !dial) return
     // The host dials whatever connection is routed now: never bind a socket to
     // an outgoing scope's key (the effect reruns once the scope publishes).
     const routed = routedScope()
     if (routed !== null && routed !== scope) return
     const generation = liveGeneration
+    const list = boardsKey.split('\u0001')
     let current = true
-    let lease: number | undefined
-    const close = dial(eventsPath(board, eventCursors.get(scope, board)), data => {
-      const routedNow = routedScope()
-      if (!current || generation !== liveGeneration || (routedNow !== null && routedNow !== scope)) return
-      const effect = frameEffect(data, eventCursors.processed(scope, board))
-      if (!effect.live) return
-      eventCursors.note(scope, board, effect.cursor)
-      eventCursors.markProcessed(scope, board, effect.maxEventId)
-      // Live is a lease: a silently dropped socket stops renewing it and the
-      // graph returns to fast polling.
-      setLiveKey(key)
-      window.clearTimeout(lease)
-      lease = window.setTimeout(() => setLiveKey(previous => (previous === key ? '' : previous)), LIVE_LEASE_MS)
-      if (effect.refreshGraph || effect.untargeted || effect.taskIds.length) onFrameRef.current(effect)
+    const sockets = new Map<string, { close: () => void; lease?: number }>()
+    const setLive = (board: string, on: boolean) => setLiveState(previous => {
+      if (previous.key !== sessionKey && !on) return previous
+      if (previous.key === sessionKey && previous.live.has(board) === on) return previous
+      const live = new Set(previous.key === sessionKey ? previous.live : [])
+      if (on) live.add(board)
+      else live.delete(board)
+      return { key: sessionKey, live }
     })
-    liveSockets.add(close)
+    const open = (board: string) => {
+      const state: { close: () => void; lease?: number } = { close: () => undefined }
+      sockets.set(board, state)
+      state.close = dial(eventsPath(board, eventCursors.get(scope, board)), data => {
+        const routedNow = routedScope()
+        if (!current || sockets.get(board) !== state || generation !== liveGeneration || (routedNow !== null && routedNow !== scope)) return
+        const effect = frameEffect(data, eventCursors.processed(scope, board))
+        if (!effect.live) return
+        eventCursors.note(scope, board, effect.cursor)
+        eventCursors.markProcessed(scope, board, effect.maxEventId)
+        // Live is a lease: a silently dropped socket stops renewing it and the
+        // graph returns to fast polling.
+        setLive(board, true)
+        window.clearTimeout(state.lease)
+        state.lease = window.setTimeout(() => setLive(board, false), LIVE_LEASE_MS)
+        if (effect.refreshGraph || effect.untargeted || effect.taskIds.length) onFrameRef.current(board, effect)
+      })
+      liveSockets.add(state.close)
+    }
+    const shut = (board: string) => {
+      const state = sockets.get(board)
+      if (!state) return
+      sockets.delete(board)
+      window.clearTimeout(state.lease)
+      if (liveSockets.delete(state.close)) state.close()
+      // A reopened socket for the same board must earn "live" again.
+      setLive(board, false)
+    }
+    const onReopen = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail
+      for (const board of list) {
+        if (detail === `${scope}\u0000${board}`) {
+          shut(board)
+          open(board)
+        }
+      }
+    }
+    for (const board of list) open(board)
+    socketReopen.addEventListener('reopen', onReopen)
     return () => {
       current = false
-      window.clearTimeout(lease)
-      if (liveSockets.delete(close)) close()
-      // A reopened socket for the same board must earn "live" again.
-      setLiveKey(previous => (previous === key ? '' : previous))
+      socketReopen.removeEventListener('reopen', onReopen)
+      for (const board of [...sockets.keys()]) shut(board)
     }
-  }, [board, key, scope, reopen])
-  return Boolean(key) && liveKey === key
+  }, [boardsKey, scope, sessionKey])
+  return Boolean(sessionKey) && liveState.key === sessionKey && allSocketsLive(targets, liveState.live)
 }
 
 function TaskInspectorController({
   board,
+  boardLabel,
   children,
   manual,
   onClose,
@@ -463,7 +510,10 @@ function TaskInspectorController({
   scope,
   task
 }: {
+  /** The task's own board: every read and write goes there. */
   board: string
+  /** All-boards view: shown in the drawer. */
+  boardLabel?: string
   children: GraphTask[]
   manual: ManualMoves
   onClose: () => void
@@ -566,6 +616,7 @@ function TaskInspectorController({
 
   return (
     <Inspector
+      boardLabel={boardLabel}
       children={children}
       comments={detailQuery.data?.comments ?? []}
       detailError={detailQuery.error ? errText(detailQuery.error) : ''}
@@ -610,7 +661,9 @@ function GraphPage() {
   const restoreNodeIdRef = useRef<string | null>(null)
   const detailRefetchRef = useRef<null | (() => Promise<unknown>)>(null)
   const graphRefetchRef = useRef<null | (() => Promise<unknown>)>(null)
-  const selectedIdRef = useRef<string | null>(null)
+  // The open task's own board and id: live frames are per board.
+  const selectedTaskRef = useRef<null | { board: string; id: string }>(null)
+  const linkedCacheRef = useRef(new Map<string, LinkedLayout>())
   const refetchedForSlugRef = useRef('')
   // Search runs on every card; let typing stay responsive on large boards.
   const deferredQuery = useDeferredValue(filters.query)
@@ -649,31 +702,44 @@ function GraphPage() {
     selection,
     serverCurrent: boardsQuery.data?.current ?? ''
   })
-  const [liveBoard, setLiveBoard] = useState({ key: '', initialized: false })
+  const allMode = boardValue === ALL_BOARDS
+  const liveKey = `${scope}\u0000${boardValue}`
+  const [liveTarget, setLiveTarget] = useState<{ key: string; boards: readonly string[] }>({ key: '', boards: NO_BOARDS })
   const liveFrames = useMemo(() => {
     const graph = coalesce(() => void graphRefetchRef.current?.(), LIVE_COALESCE_MS)
     const detail = coalesce(() => void detailRefetchRef.current?.(), LIVE_COALESCE_MS)
     return {
       cancel: () => { graph.cancel(); detail.cancel() },
-      onFrame: (effect: FrameEffect) => {
+      // A frame for board X refetches the (all-boards) graph, and the open
+      // detail only when its task lives on X and was touched.
+      onFrame: (board: string, effect: FrameEffect) => {
         if (effect.refreshGraph) graph.schedule()
-        if (touchesTask(effect, selectedIdRef.current)) detail.schedule()
+        const open = selectedTaskRef.current
+        if (open && open.board === board && touchesTask(effect, open.id)) detail.schedule()
       }
     }
   }, [])
   useEffect(() => liveFrames.cancel, [liveFrames])
-  const live = useLiveEvents(scope, boardValue, liveBoard.key === `${scope}\u0000${boardValue}` && liveBoard.initialized, liveFrames.onFrame)
+  const live = useLiveEvents(scope, liveTarget.key === liveKey ? liveTarget.boards : NO_BOARDS, liveFrames.onFrame)
   const graphQuery = useQuery<GraphPayload>({
     queryKey: ['kanban-graph', CACHE_SCHEMA_VERSION, scope, 'graph', boardValue, includeArchived],
-    queryFn: () => scopedGet<GraphPayload>(scope, `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`).then(graph => {
-      // The snapshot's event tail (before `select` strips it): a socket opened
-      // later resumes from here instead of the server's tail.
-      if (graph.board.initialized) {
-        const tail = graph.board.latest_event_id
-        if (typeof tail === 'number' && eventCursors.rewindIfBehind(scope, graph.board.slug, tail)) {
-          socketReopen.dispatchEvent(new CustomEvent('reopen', { detail: `${scope}\u0000${graph.board.slug}` }))
+    queryFn: () => scopedGet<GraphPayload>(
+      scope,
+      boardValue === ALL_BOARDS
+        ? `/graph/all?include_archived=${includeArchived}`
+        : `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`
+    ).then(graph => {
+      // The snapshot's event tails (before `select` strips them): a socket
+      // opened later resumes from here instead of the server's tail.
+      const tails = graph.boards
+        ? graph.boards.filter(board => board.initialized && !board.error).map(board => [board.slug, board.latest_event_id] as const)
+        : graph.board.initialized ? [[graph.board.slug, graph.board.latest_event_id] as const] : []
+      for (const [slug, tail] of tails) {
+        if (typeof tail !== 'number') continue
+        if (eventCursors.rewindIfBehind(scope, slug, tail)) {
+          socketReopen.dispatchEvent(new CustomEvent('reopen', { detail: `${scope}\u0000${slug}` }))
         }
-        eventCursors.note(scope, graph.board.slug, tail)
+        eventCursors.note(scope, slug, tail)
       }
       return graph
     }),
@@ -687,10 +753,10 @@ function GraphPage() {
     select: stripEventCursor,
     refetchInterval: graphPollMs(live)
   })
-  const positionContext = boardValue
-    ? (scope === LOCAL_SCOPE ? `${boardValue}:${settings.direction}` : `${scope}:${boardValue}:${settings.direction}`)
-    : ''
-  const filtersActive = Boolean(filters.query.trim() || filters.status || filters.assignee || filters.tenant || filters.linkedOnly)
+  // All boards: `[scope:]*all*:direction`, never a per-board context.
+  const positionContext = positionContextFor(scope, boardValue, settings.direction)
+  const boardFilter = allMode ? filters.board ?? '' : ''
+  const filtersActive = Boolean(filters.query.trim() || filters.status || filters.assignee || filters.tenant || filters.linkedOnly || boardFilter)
   const positionOverrides = positionContext ? positionStore[positionContext]?.positions ?? EMPTY_POSITIONS : EMPTY_POSITIONS
 
   const payload = boardValue && graphQuery.data?.board.slug === boardValue ? graphQuery.data : undefined
@@ -698,52 +764,81 @@ function GraphPage() {
   useEffect(() => {
     graphRefetchRef.current = refetchGraph
   }, [refetchGraph])
-  useEffect(() => {
-    selectedIdRef.current = selectedId
-  }, [selectedId])
-  // Open the socket only for a board whose database exists (the backend
-  // refuses others) and only once its snapshot set the resume cursor.
-  const payloadInitialized = Boolean(payload?.board.initialized) && !graphQuery.isPlaceholderData
+  // Open sockets only for boards whose database exists (the backend refuses
+  // others) and only once their snapshot set the resume cursor.
   useEffect(() => {
     if (!payload || graphQuery.isPlaceholderData) return
-    setLiveBoard({ key: `${scope}\u0000${boardValue}`, initialized: payloadInitialized })
-  }, [boardValue, graphQuery.isPlaceholderData, payload, payloadInitialized, scope])
+    const boards = payload.boards
+      ? payload.boards.filter(board => board.initialized && !board.error).map(board => board.slug)
+      : payload.board.initialized ? [boardValue] : []
+    setLiveTarget(previous => previous.key === liveKey && previous.boards.join('\u0001') === boards.join('\u0001')
+      ? previous
+      : { key: liveKey, boards })
+  }, [boardValue, graphQuery.isPlaceholderData, liveKey, payload])
   const refreshing = Boolean(payload) && graphQuery.isPlaceholderData
   const searchFilters = useMemo(() => ({ ...filters, query: deferredQuery }), [deferredQuery, filters])
-  const selected = useMemo(() => payload?.nodes.find(task => task.id === selectedId) ?? null, [payload, selectedId])
-  const filtered = useMemo(() => payload ? filterGraph(payload, searchFilters) : null, [payload, searchFilters])
-  const decorated = useMemo(() => {
-    if (!filtered || !payload) return null
-    const counts = new Map<string, number>()
-    for (const edge of filtered.edges) {
-      counts.set(edge.source, (counts.get(edge.source) ?? 0) + 1)
-      counts.set(edge.target, (counts.get(edge.target) ?? 0) + 1)
+  // One slice per board: the selected board alone, or every board of the
+  // all-boards payload (followed board first, then alphabetical).
+  const slices = useMemo<BoardSlice[]>(() => {
+    if (!payload) return []
+    if (!allMode) return [{ board: payload.board.slug, label: payload.board.slug, payload }]
+    return splitAllBoards(payload, followedSlug)
+  }, [allMode, followedSlug, payload])
+  /** React Flow id of a task: namespaced by board in the all-boards view. */
+  const keyOf = useCallback((board: string, id: string) => (allMode ? nodeKey(board, id) : id), [allMode])
+  const taskIndex = useMemo(() => {
+    const index = new Map<string, { board: string; task: GraphTask }>()
+    for (const slice of slices) for (const task of slice.payload.nodes) index.set(keyOf(slice.board, task.id), { board: slice.board, task })
+    return index
+  }, [keyOf, slices])
+  const visibleSlices = useMemo(() => (boardFilter ? slices.filter(slice => slice.board === boardFilter) : slices), [boardFilter, slices])
+  const filteredSlices = useMemo(
+    () => visibleSlices.map(slice => ({ ...slice, payload: filterGraph(slice.payload, searchFilters) })),
+    [searchFilters, visibleSlices]
+  )
+  const filteredKeys = useMemo(
+    () => new Set(filteredSlices.flatMap(slice => slice.payload.nodes.map(task => keyOf(slice.board, task.id)))),
+    [filteredSlices, keyOf]
+  )
+  // Unmet prerequisites come from the full board, not the filtered view.
+  const decoratedSlices = useMemo(
+    () => filteredSlices.map((slice, index) => ({ ...slice, payload: decorateGraph(slice.payload, visibleSlices[index]!.payload) })),
+    [filteredSlices, visibleSlices]
+  )
+  const plans = useMemo(
+    () => decoratedSlices.map(slice => planLayout(slice.payload, settings.hideImplied, settings.direction)),
+    [decoratedSlices, settings.direction, settings.hideImplied]
+  )
+  // Dagre only re-runs when a board's linked structure changes, not on status,
+  // title or summary updates. Equal structure keys give equal Dagre output, so
+  // the cache is shared by every board.
+  const structureKey = plans.map(plan => plan.structureKey).join('\u0003')
+  const linkedLayouts = useMemo(() => {
+    const previous = linkedCacheRef.current
+    const next = new Map<string, LinkedLayout>()
+    const layouts = plans.map(plan => {
+      const layout = next.get(plan.structureKey) ?? previous.get(plan.structureKey) ?? layoutLinked(plan, settings.direction)
+      next.set(plan.structureKey, layout)
+      return layout
+    })
+    linkedCacheRef.current = next
+    return layouts
+    // Keyed on the structure on purpose: `plans` changes identity on every data update.
+  }, [structureKey])
+  const autoElements = useMemo(() => {
+    const ready = decoratedSlices.length > 0 && linkedLayouts.length === decoratedSlices.length
+    if (!ready) return { nodes: [], edges: [], linkedCount: 0, unlinkedCount: 0, impliedCount: 0 }
+    if (!allMode) {
+      return layoutGraph(decoratedSlices[0]!.payload, settings.direction, settings.edgeStyle, settings.showMotion, { plan: plans[0], linkedLayout: linkedLayouts[0], unlinkedCollapsed })
     }
-    // Unmet prerequisites come from the full board, not the filtered view.
-    const unmet = unmetParentCounts(payload)
-    return {
-      ...filtered,
-      nodes: filtered.nodes.map(task => ({ ...task, _linkCount: counts.get(task.id) ?? 0, _unmet: unmet.get(task.id) ?? 0 }))
-    }
-  }, [filtered, payload])
-  const plan = useMemo(
-    () => decorated ? planLayout(decorated, settings.hideImplied, settings.direction) : null,
-    [decorated, settings.direction, settings.hideImplied]
-  )
-  // Dagre only re-runs when the linked structure changes, not on status,
-  // title or summary updates.
-  const structureKey = plan?.structureKey ?? ''
-  const linkedLayout = useMemo(
-    () => plan ? layoutLinked(plan, settings.direction) : null,
-    // Keyed on the structure on purpose: `plan` changes identity on every data update.
-    [structureKey]
-  )
-  const autoElements = useMemo(
-    () => decorated && plan && linkedLayout
-      ? layoutGraph(decorated, settings.direction, settings.edgeStyle, settings.showMotion, { plan, linkedLayout, unlinkedCollapsed })
-      : { nodes: [], edges: [], linkedCount: 0, unlinkedCount: 0, impliedCount: 0 },
-    [decorated, linkedLayout, plan, settings.direction, settings.edgeStyle, settings.showMotion, unlinkedCollapsed]
-  )
+    return layoutBoards(
+      decoratedSlices.map((slice, index) => ({ ...slice, plan: plans[index], linkedLayout: linkedLayouts[index] })),
+      settings.direction,
+      settings.edgeStyle,
+      settings.showMotion,
+      { unlinkedCollapsed }
+    )
+  }, [allMode, decoratedSlices, linkedLayouts, plans, settings.direction, settings.edgeStyle, settings.showMotion, unlinkedCollapsed])
   const positionedNodes = useMemo(
     () => applyPositionOverrides(autoElements.nodes, positionOverrides),
     [autoElements, positionOverrides]
@@ -753,8 +848,31 @@ function GraphPage() {
   // a background refetch brought in; the drop re-syncs.
   const liveCurrent = liveNodes.context === positionContext && (dragging || liveNodes.signature === nodeSignature)
   const displayedNodes = liveCurrent ? liveNodes.nodes : positionedNodes
-  const stats = useMemo(() => filtered ? summarizeGraph(filtered) : null, [filtered])
-  const chips = useMemo(() => statusBreakdown(payload?.nodes ?? []), [payload])
+  const stats = useMemo(() => {
+    if (!payload) return null
+    const total = { total: 0, linked: 0, isolated: 0, blocked: 0, done: 0 }
+    for (const slice of filteredSlices) {
+      const part = summarizeGraph(slice.payload)
+      total.total += part.total
+      total.linked += part.linked
+      total.isolated += part.isolated
+      total.blocked += part.blocked
+      total.done += part.done
+    }
+    return total
+  }, [filteredSlices, payload])
+  const chips = useMemo(() => statusBreakdown(visibleSlices.flatMap(slice => slice.payload.nodes)), [visibleSlices])
+  const selectedEntry = selectedId ? taskIndex.get(selectedId) ?? null : null
+  const selected = selectedEntry?.task ?? null
+  const selectedBoard = selectedEntry?.board ?? ''
+  useEffect(() => {
+    selectedTaskRef.current = selectedEntry ? { board: selectedEntry.board, id: selectedEntry.task.id } : null
+  }, [selectedEntry])
+  // All-boards view: a board filter in the filter menu, in band order.
+  const boardFilterOptions = useMemo(
+    () => (allMode ? slices.map(slice => ({ slug: slice.board, label: slice.label })) : undefined),
+    [allMode, slices]
+  )
   const assignees = useMemo(() => [...new Set((payload?.nodes ?? []).map(node => node.assignee).filter(Boolean) as string[])].sort(), [payload])
   const tenants = useMemo(() => [...new Set((payload?.nodes ?? []).map(node => node.tenant).filter(Boolean) as string[])].sort(), [payload])
 
@@ -776,7 +894,8 @@ function GraphPage() {
     })
   }, [])
   const activateNode = useCallback((id: string) => {
-    if (id === UNLINKED_SECTION_ID) toggleUnlinked()
+    if (isBandId(id)) return
+    if (isSectionId(id)) toggleUnlinked()
     else setSelectedId(id)
   }, [toggleUnlinked])
   // One stable handler for every node keeps memoized cards from re-rendering.
@@ -790,6 +909,7 @@ function GraphPage() {
   }, [activateNode])
 
   const focusedNodes = useMemo(() => displayedNodes.map(node => {
+    if (node.type === 'band') return { ...node, deletable: false, focusable: false, selectable: false }
     if (!isTaskNode(node)) {
       return { ...node, ariaLabel: t(node.data.collapsed ? 'section.expand' : 'section.collapse'), deletable: false, domAttributes: { onKeyDownCapture: onNodeKeyDown } }
     }
@@ -809,14 +929,16 @@ function GraphPage() {
     zIndex: selectedId && (edge.source === selectedId || edge.target === selectedId) ? 2 : 0
   })), [autoElements.edges, selectedId])
 
+  // Links never cross boards: the selected task's own board has them all.
   const relationships = useMemo(() => {
-    if (!payload || !selected) return { parents: [], children: [] }
-    const byId = new Map(payload.nodes.map(task => [task.id, task]))
+    const board = slices.find(slice => slice.board === selectedBoard)?.payload
+    if (!board || !selected) return { parents: [], children: [] }
+    const byId = new Map(board.nodes.map(task => [task.id, task]))
     return {
-      parents: payload.edges.filter(edge => edge.target === selected.id).flatMap(edge => byId.get(edge.source) ?? []),
-      children: payload.edges.filter(edge => edge.source === selected.id).flatMap(edge => byId.get(edge.target) ?? [])
+      parents: board.edges.filter(edge => edge.target === selected.id).flatMap(edge => byId.get(edge.source) ?? []),
+      children: board.edges.filter(edge => edge.source === selected.id).flatMap(edge => byId.get(edge.target) ?? [])
     }
-  }, [payload, selected])
+  }, [selected, selectedBoard, slices])
 
   const writePositionStore = (next: PositionStore) => {
     if (next === positionStoreRef.current) return
@@ -862,7 +984,8 @@ function GraphPage() {
   const chooseBoard = (next: string) => {
     setSelection(next)
     setSelectedId(null)
-    pluginStorage?.set(scopedKey('board-selection', scope), next)
+    setFilters(current => (current.board ? { ...current, board: '' } : current))
+    pluginStorage?.set(boardSelectionStorageKey(scope), next)
   }
   const clearFilters = () => {
     setFilters(EMPTY_FILTERS)
@@ -872,7 +995,7 @@ function GraphPage() {
     setFilters(EMPTY_FILTERS)
     if (task.status === 'archived') setIncludeArchived(true)
     if (unlinkedCollapsed) toggleUnlinked()
-    setSelectedId(task.id)
+    setSelectedId(keyOf(task.board ?? selectedBoard, task.id))
   }
   const refreshAll = () => {
     void graphQuery.refetch()
@@ -884,14 +1007,18 @@ function GraphPage() {
   // shows its own board selection, which a plugin cannot set.
   const kanbanEnabled = isCoreKanbanEnabled()
   const boardName = (slug: string) => {
-    const board = availableBoards.find(item => item.slug === slug)
+    const board = availableBoards.find(item => item.slug === slug) ?? payload?.boards?.find(item => item.slug === slug)
     return board?.name || board?.slug || slug
   }
   const openKanbanLabel = !kanbanEnabled
     ? t('state.kanbanDisabled')
-    : boardValue && followedSlug && boardValue !== followedSlug
-      ? t('inspector.openKanbanOther', boardName(followedSlug))
-      : t('inspector.openKanban')
+    : allMode && selectedBoard
+      ? selectedBoard === followedSlug
+        ? t('inspector.openKanbanOn', boardName(selectedBoard))
+        : t('inspector.openKanbanTaskOther', boardName(selectedBoard), boardName(followedSlug))
+      : boardValue && followedSlug && boardValue !== followedSlug
+        ? t('inspector.openKanbanOther', boardName(followedSlug))
+        : t('inspector.openKanban')
   const openKanban = () => {
     if (!isCoreKanbanEnabled()) {
       host.notify({ kind: 'warning', message: t('state.kanbanDisabled') })
@@ -900,7 +1027,7 @@ function GraphPage() {
     host.navigate('/kanban')
   }
 
-  const hasFilters = Boolean(filters.query || filters.status || filters.assignee || filters.tenant || filters.linkedOnly || includeArchived)
+  const hasFilters = Boolean(filters.query || filters.status || filters.assignee || filters.tenant || filters.linkedOnly || boardFilter || includeArchived)
   const inspectorOpen = Boolean(selectedId)
   const loadError = (!boardsQuery.data && boardsQuery.error) || (!payload && graphQuery.error)
   const loading = boardsQuery.isLoading || (Boolean(boardValue) && !payload && !graphQuery.error)
@@ -919,8 +1046,8 @@ function GraphPage() {
   useEffect(() => {
     if (!payload || !positionContext || refreshing || payload.truncated) return
     if (!includeArchived && (payload.archived_count ?? 0) > 0) return
-    writePositionStore(prunePositions(positionStoreRef.current, positionContext, new Set(payload.nodes.map(task => task.id))))
-  }, [includeArchived, payload, positionContext, refreshing])
+    writePositionStore(prunePositions(positionStoreRef.current, positionContext, new Set(taskIndex.keys())))
+  }, [includeArchived, payload, positionContext, refreshing, taskIndex])
   useEffect(() => {
     if (dragging) return
     setLiveNodes(current => {
@@ -949,10 +1076,10 @@ function GraphPage() {
     return () => cancelAnimationFrame(frame)
   }, [focusedNodes.length, payload?.board.slug, scope, settings.direction])
   useEffect(() => {
-    if (!selectedId || !filtered || refreshing) return
-    const visible = filtered.nodes.some(task => task.id === selectedId) && displayedNodes.some(node => node.id === selectedId)
+    if (!selectedId || !payload || refreshing) return
+    const visible = filteredKeys.has(selectedId) && displayedNodes.some(node => node.id === selectedId)
     if (!visible) setSelectedId(null)
-  }, [displayedNodes, filtered, refreshing, selectedId])
+  }, [displayedNodes, filteredKeys, payload, refreshing, selectedId])
   useEffect(() => {
     if (!inspectorOpen) return
     restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -996,13 +1123,13 @@ function GraphPage() {
     if (hasFilters) {
       return <div className="hkg-state"><EmptyState description={t('state.noMatchHint')} title={t('state.noMatch')} /><Button onClick={clearFilters} size="sm" variant="outline">{t('state.clearFilters')}</Button></div>
     }
-    if (payload?.board.initialized === false) {
+    if (payload?.board.initialized === false && !allMode) {
       return <div className="hkg-state"><EmptyState description={t('state.notInitializedHint')} title={t('state.notInitialized')} />{openKanbanAction}</div>
     }
     if (archivedHidden > 0) {
-      return <div className="hkg-state"><EmptyState description={t('state.allArchivedHint')} title={t('state.allArchived', archivedHidden)} /><Button onClick={() => setIncludeArchived(true)} size="sm" variant="outline">{t('state.showArchived')}</Button></div>
+      return <div className="hkg-state"><EmptyState description={t('state.allArchivedHint')} title={t(allMode ? 'state.allArchivedAll' : 'state.allArchived', archivedHidden)} /><Button onClick={() => setIncludeArchived(true)} size="sm" variant="outline">{t('state.showArchived')}</Button></div>
     }
-    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t('state.empty')} />{openKanbanAction}</div>
+    return <div className="hkg-state"><EmptyState description={t('state.emptyHint')} title={t(allMode ? 'state.emptyAll' : 'state.empty')} />{openKanbanAction}</div>
   }
 
   return (
@@ -1012,8 +1139,8 @@ function GraphPage() {
         <PageHeaderControl>
           {inline => <BoardSwitcher boards={availableBoards} followedSlug={followedSlug} inline={inline} onChange={chooseBoard} selection={selection} />}
         </PageHeaderControl>
-        <span className="hkg-count">{filtered?.nodes.length ?? payload?.nodes.length ?? 0}</span>
-        <FilterMenu assignees={assignees} filters={filters} includeArchived={includeArchived} onArchived={setIncludeArchived} onChange={patchFilters} tenants={tenants} />
+        <span className="hkg-count">{stats?.total ?? 0}</span>
+        <FilterMenu assignees={assignees} boards={boardFilterOptions} filters={filters} includeArchived={includeArchived} onArchived={setIncludeArchived} onChange={patchFilters} tenants={tenants} />
         <SearchField aria-label={t('toolbar.filterTasks')} containerClassName="hkg-search" onChange={(value: string) => patchFilters({ query: value })} placeholder={t('toolbar.filterTasks')} value={filters.query} />
         <StatusChips active={filters.status} counts={chips} onToggle={status => patchFilters({ status: filters.status === status ? '' : status })} />
         <div className="hkg-spacer" />
@@ -1076,6 +1203,7 @@ function GraphPage() {
             {settings.showMiniMap && (
               <MiniMap
                 nodeColor={node => (isTaskNode(node as GraphNode) ? statusMeta(String((node as GraphNode).data.status)).tone : 'transparent')}
+                nodeStrokeColor={node => ((node as GraphNode).type === 'band' ? 'var(--ui-stroke-tertiary)' : 'transparent')}
                 nodeStrokeWidth={2}
                 pannable
                 position="bottom-right"
@@ -1085,10 +1213,11 @@ function GraphPage() {
           </ReactFlow>
         )}
         {focusedNodes.length > 0 && <div className="hkg-canvas-hint"><span>{t('canvas.linked', stats?.linked ?? 0)}</span><span>{t('canvas.hint')}</span></div>}
-        {selected && (
+        {selected && selectedBoard && (
           <TaskInspectorController
-            key={`${scope}:${boardValue}:${selected.id}`}
-            board={boardValue}
+            key={`${scope}:${selectedBoard}:${selected.id}`}
+            board={selectedBoard}
+            boardLabel={allMode ? boardName(selectedBoard) : undefined}
             children={relationships.children}
             manual={manual}
             onClose={() => setSelectedId(null)}

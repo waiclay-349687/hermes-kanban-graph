@@ -324,3 +324,10 @@
 .hkg-root .react-flow__edge.hkg-edge-related .hkg-status-edge-implied { opacity: .7; }
 
 .hkg-board-switcher-host { display: contents; }
+
+/* ── v0.5: all-boards bands ─────────────────────────────────────────────── */
+.hkg-root .react-flow__node-band { pointer-events: none !important; cursor: default; }
+.hkg-band { box-sizing: border-box; border: 1px dashed var(--ui-stroke-tertiary); border-radius: 10px; background: color-mix(in srgb, var(--ui-bg-quaternary) 32%, transparent); }
+.hkg-band-primary { border-style: solid; border-color: var(--ui-stroke-secondary); }
+.hkg-band-header { height: 40px; display: flex; align-items: center; gap: 7px; padding: 0 14px; color: var(--ui-text-secondary); font-size: 12px; font-weight: 600; user-select: none; }
+.hkg-band-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

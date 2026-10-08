@@ -111,6 +111,8 @@ export interface GraphTask {
   /** Links to tasks cut by the server's node cap (not archived). */
   truncated_parent_count?: number
   truncated_child_count?: number
+  /** Owning board; set on every task of the all-boards view (`/graph/all`). */
+  board?: string
 }
 
 export interface TaskComment {
@@ -140,6 +142,26 @@ export interface GraphLink {
   id: string
   source: string
   target: string
+  /** Owning board (all-boards view); links never cross boards. */
+  board?: string
+}
+
+/** One board of the all-boards view (`GET /graph/all`). */
+export interface BoardGraphMeta {
+  slug: string
+  name?: string | null
+  icon?: string | null
+  is_current?: boolean
+  initialized: boolean
+  latest_event_id: number
+  /** Tasks matched on this board before any cap. */
+  total: number
+  /** Tasks of this board present in the response. */
+  shown: number
+  archived_count: number
+  truncated: boolean
+  /** The board's database could not be read. */
+  error?: boolean
 }
 
 export interface GraphPayload {
@@ -150,6 +172,8 @@ export interface GraphPayload {
   truncated?: boolean
   /** Tasks the server matched before applying its node cap. */
   total_count?: number
+  /** All-boards view only: every open board, initialized or not. */
+  boards?: BoardGraphMeta[]
 }
 
 /**
@@ -158,7 +182,9 @@ export interface GraphPayload {
  * unchanged board the same object, so nothing downstream re-runs.
  */
 export function stripEventCursor(payload: GraphPayload): GraphPayload {
-  return { ...payload, board: { ...payload.board, latest_event_id: 0 } }
+  const stripped = { ...payload, board: { ...payload.board, latest_event_id: 0 } }
+  if (payload.boards) stripped.boards = payload.boards.map(board => ({ ...board, latest_event_id: 0 }))
+  return stripped
 }
 
 export interface SectionData extends Record<string, unknown> {
@@ -167,9 +193,22 @@ export interface SectionData extends Record<string, unknown> {
   width: number
 }
 
+export interface BandData extends Record<string, unknown> {
+  board: string
+  label: string
+  /** Cards of this board in the current (filtered) view. */
+  count: number
+  width: number
+  height: number
+  /** The followed/current board, drawn first. */
+  primary: boolean
+}
+
 export type TaskNode = Node<GraphTask, 'task'>
 export type SectionNode = Node<SectionData, 'section'>
-export type GraphNode = SectionNode | TaskNode
+/** Background label of one board in the all-boards view. */
+export type BandNode = Node<BandData, 'band'>
+export type GraphNode = BandNode | SectionNode | TaskNode
 /** `linked` records which region the card was in when dragged (absent on 0.2 entries). */
 export interface SavedPosition extends XYPosition {
   linked?: boolean
@@ -186,6 +225,95 @@ const SECTION_GAP = 56
 const MARGIN = 48
 
 export const isTaskNode = (node: GraphNode): node is TaskNode => node.type === 'task'
+
+// ── all boards ───────────────────────────────────────────────────────────────
+
+/** Selection value of the all-boards view. Never a valid slug (`*` is rejected). */
+export const ALL_BOARDS = '*all*'
+/** Board slugs are `[a-z0-9][a-z0-9_-]*`, so `::` cannot occur inside one. */
+export const NODE_KEY_SEP = '::'
+const BAND_PREFIX = `hkg:band${NODE_KEY_SEP}`
+const BAND_PAD = 28
+const BAND_HEADER = 40
+const BAND_GAP = 64
+const BAND_MIN_WIDTH = NODE_WIDTH + 2 * BAND_PAD
+
+/** React Flow id of a card in the all-boards view: task ids are only unique per board. */
+export const nodeKey = (board: string, taskId: string) => `${board}${NODE_KEY_SEP}${taskId}`
+export const bandId = (board: string) => `${BAND_PREFIX}${board}`
+export const isBandId = (id: string) => id.startsWith(BAND_PREFIX)
+/** The unlinked-section header, in a single board or any band. */
+export const isSectionId = (id: string) => id === UNLINKED_SECTION_ID || id.endsWith(`${NODE_KEY_SEP}${UNLINKED_SECTION_ID}`)
+
+export interface BoardSlice {
+  board: string
+  label: string
+  payload: GraphPayload
+}
+
+/**
+ * Band order: the followed/current board first, then the rest alphabetically
+ * by display name (slug as tiebreak).
+ */
+export function orderBoards<T extends { slug: string; name?: string | null }>(boards: readonly T[], first: string): T[] {
+  const label = (board: T) => board.name || board.slug
+  return [...boards].sort((a, b) =>
+    Number(b.slug === first) - Number(a.slug === first)
+      || label(a).localeCompare(label(b))
+      || a.slug.localeCompare(b.slug))
+}
+
+/**
+ * Splits an all-boards payload into one ordinary per-board payload each, so
+ * filtering, implied-link reduction and Dagre run per board unchanged. Boards
+ * without cards (uninitialized, empty) produce no slice.
+ */
+export function splitAllBoards(payload: GraphPayload, first: string): BoardSlice[] {
+  const nodes = new Map<string, GraphTask[]>()
+  const edges = new Map<string, GraphLink[]>()
+  for (const task of payload.nodes) {
+    if (!task.board) continue
+    const list = nodes.get(task.board)
+    if (list) list.push(task)
+    else nodes.set(task.board, [task])
+  }
+  for (const edge of payload.edges) {
+    if (!edge.board) continue
+    const list = edges.get(edge.board)
+    if (list) list.push(edge)
+    else edges.set(edge.board, [edge])
+  }
+  const meta = new Map((payload.boards ?? []).map(board => [board.slug, board]))
+  for (const slug of nodes.keys()) if (!meta.has(slug)) meta.set(slug, { slug, initialized: true, latest_event_id: 0, total: 0, shown: 0, archived_count: 0, truncated: false })
+  return orderBoards([...meta.values()], first)
+    .filter(board => nodes.has(board.slug))
+    .map(board => ({
+      board: board.slug,
+      label: board.name || board.slug,
+      payload: {
+        board: { slug: board.slug, latest_event_id: 0, initialized: true },
+        nodes: nodes.get(board.slug)!,
+        edges: edges.get(board.slug) ?? [],
+        archived_count: board.archived_count,
+        truncated: board.truncated,
+        total_count: board.total
+      }
+    }))
+}
+
+/** Per-card link count and unmet prerequisites (from the unfiltered board). */
+export function decorateGraph(filtered: GraphPayload, full: GraphPayload): GraphPayload {
+  const counts = new Map<string, number>()
+  for (const edge of filtered.edges) {
+    counts.set(edge.source, (counts.get(edge.source) ?? 0) + 1)
+    counts.set(edge.target, (counts.get(edge.target) ?? 0) + 1)
+  }
+  const unmet = unmetParentCounts(full)
+  return {
+    ...filtered,
+    nodes: filtered.nodes.map(task => ({ ...task, _linkCount: counts.get(task.id) ?? 0, _unmet: unmet.get(task.id) ?? 0 }))
+  }
+}
 
 export interface LayoutOptions {
   /** Hide the unlinked-task grid behind its section header. */
@@ -501,6 +629,79 @@ export function layoutGraph(
   return { nodes, edges, linkedCount: linked.length, unlinkedCount: unlinked.length, impliedCount: implied.size }
 }
 
+export interface BoardLayoutInput extends BoardSlice {
+  plan?: LayoutPlan
+  linkedLayout?: LinkedLayout
+}
+
+/**
+ * All-boards layout: every board is laid out on its own with `layoutGraph`
+ * (its Dagre block plus its unlinked grid), then the blocks are stacked along
+ * the cross axis (downwards for LR, rightwards for TB), each inside a labelled
+ * background band. Node and edge ids are namespaced with `nodeKey`, and edges
+ * only ever join cards of the same board.
+ */
+export function layoutBoards(
+  slices: readonly BoardLayoutInput[],
+  direction: LayoutDirection,
+  edgeStyle: EdgeStyle = 'elbow',
+  motion = true,
+  options: LayoutOptions = {}
+): LayoutResult {
+  const bands: GraphNode[] = []
+  const nodes: GraphNode[] = []
+  const edges: Edge<StatusEdgeData>[] = []
+  let linkedCount = 0
+  let unlinkedCount = 0
+  let impliedCount = 0
+  let cursorX = MARGIN
+  let cursorY = MARGIN
+  slices.forEach((slice, index) => {
+    if (slice.payload.nodes.length === 0) return
+    const result = layoutGraph(slice.payload, direction, edgeStyle, motion, { ...options, plan: slice.plan, linkedLayout: slice.linkedLayout })
+    if (result.nodes.length === 0) return
+    let minX = Number.POSITIVE_INFINITY
+    let minY = Number.POSITIVE_INFINITY
+    let maxX = Number.NEGATIVE_INFINITY
+    let maxY = Number.NEGATIVE_INFINITY
+    for (const node of result.nodes) {
+      minX = Math.min(minX, node.position.x)
+      minY = Math.min(minY, node.position.y)
+      maxX = Math.max(maxX, node.position.x + (node.width ?? NODE_WIDTH))
+      maxY = Math.max(maxY, node.position.y + (node.height ?? NODE_HEIGHT))
+    }
+    const width = Math.max(BAND_MIN_WIDTH, maxX - minX + 2 * BAND_PAD)
+    const height = maxY - minY + BAND_HEADER + 2 * BAND_PAD
+    const dx = cursorX + BAND_PAD - minX
+    const dy = cursorY + BAND_HEADER + BAND_PAD - minY
+    bands.push({
+      id: bandId(slice.board),
+      type: 'band',
+      data: { board: slice.board, label: slice.label, count: slice.payload.nodes.length, width, height, primary: index === 0 },
+      position: { x: cursorX, y: cursorY },
+      width,
+      height,
+      zIndex: -1,
+      draggable: false,
+      selectable: false,
+      focusable: false,
+      connectable: false
+    } as BandNode)
+    for (const node of result.nodes) {
+      nodes.push({ ...node, id: nodeKey(slice.board, node.id), position: { x: node.position.x + dx, y: node.position.y + dy } } as GraphNode)
+    }
+    for (const edge of result.edges) {
+      edges.push({ ...edge, id: nodeKey(slice.board, edge.id), source: nodeKey(slice.board, edge.source), target: nodeKey(slice.board, edge.target) })
+    }
+    linkedCount += result.linkedCount
+    unlinkedCount += result.unlinkedCount
+    impliedCount += result.impliedCount
+    if (direction === 'LR') cursorY += height + BAND_GAP
+    else cursorX += width + BAND_GAP
+  })
+  return { nodes: [...bands, ...nodes], edges, linkedCount, unlinkedCount, impliedCount }
+}
+
 function validPosition(position: XYPosition | undefined): position is XYPosition {
   return Boolean(position && Number.isFinite(position.x) && Number.isFinite(position.y))
 }
@@ -603,7 +804,7 @@ export function updatePositionOverrides(
 ): PositionOverrides {
   let next = current
   for (const change of changes) {
-    if (change.type !== 'position' || !validPosition(change.position) || change.id === UNLINKED_SECTION_ID) continue
+    if (change.type !== 'position' || !validPosition(change.position) || isSectionId(change.id) || isBandId(change.id)) continue
     if (next === current) next = { ...current }
     next[change.id] = change.position
   }
@@ -616,9 +817,11 @@ export interface GraphFilters {
   assignee: string
   tenant: string
   linkedOnly?: boolean
+  /** All-boards view only: show one board. Applied per slice, not by `filterGraph`. */
+  board?: string
 }
 
-export const EMPTY_FILTERS: GraphFilters = { query: '', status: '', assignee: '', tenant: '', linkedOnly: false }
+export const EMPTY_FILTERS: GraphFilters = { query: '', status: '', assignee: '', tenant: '', linkedOnly: false, board: '' }
 
 /** Width/case-insensitive match that also works for CJK and full-width text. */
 export function normalizeSearch(value: string): string {
@@ -696,6 +899,7 @@ export interface BoardChoice {
   archived?: boolean
 }
 
+/** Returns a board slug, `ALL_BOARDS`, or '' when there is no open board. */
 export function resolveBoardSelection({ boards, kanbanSlug, selection, serverCurrent }: {
   boards: readonly BoardChoice[]
   kanbanSlug: string
@@ -703,10 +907,27 @@ export function resolveBoardSelection({ boards, kanbanSlug, selection, serverCur
   serverCurrent: string
 }): string {
   const available = boards.filter(board => !board.archived).map(board => board.slug)
+  if (selection === ALL_BOARDS && available.length > 0) return ALL_BOARDS
   if (selection && selection !== FOLLOW_KANBAN && available.includes(selection)) return selection
   if (kanbanSlug && available.includes(kanbanSlug)) return kanbanSlug
   if (serverCurrent && available.includes(serverCurrent)) return serverCurrent
   return available[0] ?? ''
+}
+
+/** Plugin-storage key of the graph's own board selection, per connection. */
+export function boardSelectionStorageKey(scope: string): string {
+  return scope === 'local' ? 'board-selection' : `board-selection.${scope}`
+}
+
+/** A stored selection: a slug, `ALL_BOARDS` or `FOLLOW_KANBAN` (the default). */
+export function parseBoardSelection(raw: unknown): string {
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : FOLLOW_KANBAN
+}
+
+/** Saved-position context: `[scope:]board:direction`; `board` may be `ALL_BOARDS`. */
+export function positionContextFor(scope: string, board: string, direction: LayoutDirection): string {
+  if (!board) return ''
+  return scope === 'local' ? `${board}:${direction}` : `${scope}:${board}:${direction}`
 }
 
 /** localStorage key the bundled Kanban plugin persists its selected board under. */

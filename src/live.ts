@@ -76,7 +76,8 @@ export function touchesTask(effect: FrameEffect, taskId: null | string): boolean
 }
 
 /** `/events` path relative to the plugin namespace. No `since` means the server
- *  starts at the board's current tail; an explicit one replays what was missed. */
+ *  starts at the board's current tail; an explicit one replays what was missed.
+ *  One socket per board: the all-boards view opens several. */
 export function eventsPath(board: string, since?: number): string {
   const params = new URLSearchParams({ board })
   if (since !== undefined) params.set('since', String(since))
@@ -138,6 +139,21 @@ export class EventCursors {
 
 export function graphPollMs(live: boolean): number {
   return live ? LIVE_GRAPH_POLL_MS : FALLBACK_GRAPH_POLL_MS
+}
+
+/** All-boards view: at most this many event sockets; above it, polling only. */
+export const MAX_LIVE_SOCKETS = 12
+
+/** Boards that get a socket: every one, unless that exceeds the cap (then none:
+ *  a partial push would still need the fast poll for the rest). */
+export function liveSocketBoards(boards: readonly string[], cap = MAX_LIVE_SOCKETS): string[] {
+  const unique = [...new Set(boards.filter(Boolean))]
+  return unique.length <= cap ? unique : []
+}
+
+/** The push counts as live only while every opened socket holds its lease. */
+export function allSocketsLive(opened: readonly string[], live: ReadonlySet<string>): boolean {
+  return opened.length > 0 && opened.every(board => live.has(board))
 }
 
 /** Collapses a burst of calls into one trailing call `ms` later. */

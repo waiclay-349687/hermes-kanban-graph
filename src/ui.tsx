@@ -36,12 +36,14 @@ import {
 import { memo, useEffect, useRef, useState, type ChangeEvent, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react'
 
 import {
+  ALL_BOARDS,
   FOLLOW_KANBAN,
   isAdminSummary,
   statusMeta,
   TASK_STATUSES,
   type EdgeStyle,
   type GraphFilters,
+  type BandNode,
   type GraphTask,
   type LayoutDirection,
   type SectionNode,
@@ -222,7 +224,20 @@ function SectionHeaderView({ data }: NodeProps<SectionNode>) {
   )
 }
 
-export const NODE_TYPES = { task: memo(TaskCardView), section: memo(SectionHeaderView) }
+/** Background band of one board in the all-boards view (not interactive). */
+function BoardBandView({ data }: NodeProps<BandNode>) {
+  return (
+    <div className={cn('hkg-band', data.primary && 'hkg-band-primary')} style={{ width: data.width, height: data.height }}>
+      <div className="hkg-band-header">
+        <Codicon name="project" size="0.8rem" />
+        <span className="hkg-band-label">{data.label}</span>
+        <span className="hkg-section-count">{data.count}</span>
+      </div>
+    </div>
+  )
+}
+
+export const NODE_TYPES = { task: memo(TaskCardView), section: memo(SectionHeaderView), band: memo(BoardBandView) }
 export const EDGE_TYPES = { status: memo(StatusConnectionEdge) }
 
 function MenuLabel({ children }: { children: string }) {
@@ -235,6 +250,7 @@ function Check({ active }: { active: boolean }) {
 
 export function FilterMenu({
   assignees,
+  boards,
   filters,
   includeArchived,
   onArchived,
@@ -242,6 +258,8 @@ export function FilterMenu({
   tenants
 }: {
   assignees: string[]
+  /** All-boards view only: offer a board filter. */
+  boards?: { slug: string; label: string }[]
   filters: GraphFilters
   includeArchived: boolean
   onArchived: (value: boolean) => void
@@ -249,7 +267,7 @@ export function FilterMenu({
   tenants: string[]
 }) {
   const t = useT()
-  const active = Boolean(filters.status || filters.assignee || filters.tenant || filters.linkedOnly || includeArchived)
+  const active = Boolean(filters.status || filters.assignee || filters.tenant || filters.linkedOnly || includeArchived || (boards && filters.board))
 
   return (
     <DropdownMenu>
@@ -259,6 +277,18 @@ export function FilterMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="hkg-filter-menu">
+        {boards && boards.length > 0 && (
+          <>
+            <MenuLabel>{t('filter.board')}</MenuLabel>
+            <DropdownMenuItem onSelect={() => onChange({ board: '' })}>{t('board.all')}<Check active={!filters.board} /></DropdownMenuItem>
+            {boards.map(board => (
+              <DropdownMenuItem key={board.slug} onSelect={() => onChange({ board: board.slug })}>
+                <Codicon name="project" size="0.75rem" />{board.label}<Check active={filters.board === board.slug} />
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+          </>
+        )}
         <MenuLabel>{t('filter.status')}</MenuLabel>
         <DropdownMenuItem onSelect={() => onChange({ status: '' })}>{t('filter.allStatuses')}<Check active={!filters.status} /></DropdownMenuItem>
         {TASK_STATUSES.map(status => {
@@ -427,10 +457,13 @@ export function BoardSwitcher({ boards, followedSlug, inline = false, onChange, 
   const t = useT()
   if (boards.length === 0) return null
   const followed = boards.find(board => board.slug === followedSlug)
-  const following = selection === FOLLOW_KANBAN || !boards.some(board => board.slug === selection)
+  const all = selection === ALL_BOARDS
+  const following = !all && (selection === FOLLOW_KANBAN || !boards.some(board => board.slug === selection))
   const active = following ? followed : boards.find(board => board.slug === selection)
-  const label = boardLabel(active, following ? followedSlug || t('board.board') : selection)
-  const count = active?.total
+  const counted = boards.filter(board => typeof board.total === 'number')
+  const allCount = counted.length > 0 ? counted.reduce((sum, board) => sum + (board.total ?? 0), 0) : undefined
+  const label = all ? t('board.all') : boardLabel(active, following ? followedSlug || t('board.board') : selection)
+  const count = all ? allCount : active?.total
   return (
     <DropdownMenu>
       <Tip label={following ? t('board.followHint', label) : t('board.switch')}>
@@ -460,13 +493,20 @@ export function BoardSwitcher({ boards, followedSlug, inline = false, onChange, 
           {following && <Codicon className="ml-auto" name="check" size="0.8rem" />}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onChange(ALL_BOARDS)}>
+          {t('board.all')}
+          {typeof allCount === 'number' && (
+            <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{allCount}</span>
+          )}
+          {all && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+        </DropdownMenuItem>
         {boards.map(board => (
           <DropdownMenuItem key={board.slug} onSelect={() => onChange(board.slug)}>
             {boardLabel(board, board.slug)}
             {typeof board.total === 'number' && (
               <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{board.total}</span>
             )}
-            {!following && board.slug === selection && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+            {!following && !all && board.slug === selection && <Codicon className="ml-auto" name="check" size="0.8rem" />}
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>
@@ -537,6 +577,7 @@ function StatusMenu({ disabled, onChange, status, targets }: {
 }
 
 export function Inspector({
+  boardLabel: taskBoardLabel,
   children,
   comments,
   detailError,
@@ -558,6 +599,8 @@ export function Inspector({
   statusTargets,
   task
 }: {
+  /** All-boards view: the board this task lives on. */
+  boardLabel?: string
   children: GraphTask[]
   comments: TaskComment[]
   detailError: string
@@ -706,6 +749,7 @@ export function Inspector({
           <div className="hkg-detail-state hkg-detail-loading"><Loader size="sm" /><span>{t('inspector.loading')}</span></div>
         ) : <>
         <dl className="hkg-inspector-grid">
+          {taskBoardLabel && <MetaRow label={t('inspector.board')}><span className="hkg-inline-meta"><Codicon name="project" size="0.7rem" />{taskBoardLabel}</span></MetaRow>}
           <MetaRow label={t('inspector.assignee')}>{task.assignee ? <span className="hkg-inline-meta"><Avatar name={task.assignee} />{task.assignee}</span> : <span className="hkg-drawer-muted">{t('inspector.unassigned')}</span>}</MetaRow>
           <MetaRow label={t('inspector.priority')}>P{task.priority}</MetaRow>
           <MetaRow label={t('inspector.tenant')}>{task.tenant || <span className="hkg-drawer-muted">{t('inspector.none')}</span>}</MetaRow>
