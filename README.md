@@ -13,7 +13,7 @@ This plugin focuses on **working on one board inside the graph**:
 - Drag cards and keep their positions per board, with filters for status, assignee, tenant, archived and linked-only.
 - Chinese and English UI.
 
-The two plugins are unrelated codebases. If you install both, the different plugin ids keep them apart, but the sidebar labels will look alike.
+The two plugins are unrelated codebases, but **both use the plugin id `kanban-graph`**, so install only one of them. Installing one replaces the other's `plugins/kanban-graph` and `desktop-plugins/kanban-graph` directories.
 
 ## Features
 
