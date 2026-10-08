@@ -8,9 +8,9 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket
 from hermes_cli import kanban_db
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -399,6 +399,69 @@ def create_comment(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "id": comment_id}
+
+
+# --- live events ----------------------------------------------------------------
+#
+# ``ctx.socket`` only reaches this plugin's own namespace, so the graph cannot
+# open core Kanban's ``/api/plugins/kanban/events``. This route hands the socket
+# to core's ``stream_events`` unchanged: core runs the canonical WS auth gate
+# (``?token=`` / ``?ticket=`` / ``?internal=``), the ``task_events`` tail, the
+# ``since`` cursor and the ``{"events": [...], "cursor": n}`` frames. Tickets are
+# single-use, so the gate is consulted exactly once, by core.
+#
+# Before handing over, the board is checked with the same rules as ``/graph``
+# (400 malformed / 404 unknown -> close 1008), and a board whose database does
+# not exist yet is refused (1008) because core's tail would create it. These
+# checks run before core's auth gate; a close before ``accept`` is an HTTP 403
+# handshake rejection whatever the code, so an unauthenticated caller learns
+# nothing from them. Without a usable core ``stream_events`` the socket closes
+# with 1011 and the frontend stays on polling.
+
+_WS_POLICY_VIOLATION = 1008
+_WS_INTERNAL_ERROR = 1011
+# Sent once after core accepts the socket: tells the frontend the push is live
+# so it can slow its polling. Core's own client ignores frames without events.
+HELLO_FRAME: dict[str, Any] = {"events": [], "hello": True}
+
+
+def _core_event_stream() -> Optional[Callable[[WebSocket], Awaitable[None]]]:
+    try:
+        core = _core_dashboard()
+    except HTTPException as exc:
+        log.info("kanban-graph: live events unavailable: %s", exc.detail)
+        return None
+    stream = getattr(core, "stream_events", None)
+    return stream if callable(stream) else None
+
+
+def _say_hello_on_accept(ws: WebSocket) -> None:
+    accept = ws.accept
+
+    async def accept_then_hello(*args: Any, **kwargs: Any) -> None:
+        await accept(*args, **kwargs)
+        try:
+            await ws.send_json(HELLO_FRAME)
+        except Exception:  # client already gone: core's receive loop notices
+            pass
+
+    ws.accept = accept_then_hello  # type: ignore[method-assign]
+
+
+@router.websocket("/events")
+async def stream_events(ws: WebSocket):
+    try:
+        slug = _resolve_board(ws.query_params.get("board"))
+        _require_initialized(slug)
+    except HTTPException:
+        await ws.close(code=_WS_POLICY_VIOLATION)
+        return
+    stream = _core_event_stream()
+    if stream is None:
+        await ws.close(code=_WS_INTERNAL_ERROR)
+        return
+    _say_hello_on_accept(ws)
+    await stream(ws)
 
 
 @router.post("/dispatch")

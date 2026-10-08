@@ -593,3 +593,167 @@ def test_route_surface_includes_workflow_and_dispatch():
     }
     assert ('/workflow', frozenset({'GET'})) in routes
     assert ('/dispatch', frozenset({'POST'})) in routes
+
+
+# --- live events --------------------------------------------------------------
+#
+# Starlette's TestClient needs an HTTP client package this venv does not ship,
+# so the socket is driven over raw ASGI messages instead.
+
+import asyncio
+import json
+
+
+class _Closed(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class _Socket:
+    def __init__(self, outgoing):
+        self._outgoing = outgoing
+
+    async def receive_json(self, timeout=10.0):
+        message = await asyncio.wait_for(self._outgoing.get(), timeout)
+        if message['type'] == 'websocket.close':
+            raise _Closed(message.get('code', 1000))
+        assert message['type'] == 'websocket.send', message
+        return json.loads(message['text'])
+
+    async def receive_events(self):
+        while True:
+            frame = await self.receive_json()
+            if frame.get('events'):
+                return frame
+
+
+async def _with_events_socket(query, script):
+    """Open ``/events?<query>`` on our router, run ``script(socket)`` once the
+    handshake is accepted, then disconnect. Raises ``_Closed`` on a refusal."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(plugin_api.router, prefix='/api/plugins/kanban-graph')
+    incoming: asyncio.Queue = asyncio.Queue()
+    outgoing: asyncio.Queue = asyncio.Queue()
+    await incoming.put({'type': 'websocket.connect'})
+    scope = {
+        'type': 'websocket',
+        'asgi': {'version': '3.0'},
+        'scheme': 'ws',
+        'path': '/api/plugins/kanban-graph/events',
+        'raw_path': b'/api/plugins/kanban-graph/events',
+        'query_string': query.encode(),
+        'root_path': '',
+        'headers': [],
+        'client': ('127.0.0.1', 1),
+        'server': ('127.0.0.1', 80),
+        'subprotocols': [],
+        'state': {},
+    }
+    server = asyncio.create_task(app(scope, incoming.get, outgoing.put))
+    try:
+        opened = await asyncio.wait_for(outgoing.get(), 10.0)
+        if opened['type'] == 'websocket.close':
+            raise _Closed(opened.get('code', 1000))
+        assert opened['type'] == 'websocket.accept', opened
+        return await script(_Socket(outgoing))
+    finally:
+        await incoming.put({'type': 'websocket.disconnect', 'code': 1000})
+        await asyncio.wait_for(server, 10.0)
+
+
+def _open_events(query, script=None):
+    async def default(socket):
+        return await socket.receive_json()
+
+    return asyncio.run(_with_events_socket(query, script or default))
+
+
+def _create_task(title):
+    conn = _connect('default')
+    try:
+        return plugin_api.kanban_db.create_task(conn, title=title, initial_status='blocked', board='default')
+    finally:
+        conn.close()
+
+
+def test_events_route_is_a_websocket_on_our_router():
+    from starlette.routing import WebSocketRoute
+
+    paths = {route.path for route in plugin_api.router.routes if isinstance(route, WebSocketRoute)}
+    assert '/events' in paths
+
+
+def test_events_stream_delegates_to_core_and_advances_the_cursor(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    gate_calls = []
+    monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: gate_calls.append(ws) or True)
+
+    async def script(socket):
+        assert await socket.receive_json() == plugin_api.HELLO_FRAME
+        first = await socket.receive_events()
+        assert any(event['task_id'] == editable_task for event in first['events'])
+        second_task = await asyncio.to_thread(_create_task, 'Pushed live')
+        second = await socket.receive_events()
+        assert second['cursor'] > first['cursor']
+        assert all(event['id'] > first['cursor'] for event in second['events'])
+        assert any(event['task_id'] == second_task for event in second['events'])
+
+    _open_events('board=default&since=0', script)
+    assert len(gate_calls) == 1  # core's single-use auth gate ran exactly once
+
+
+def test_events_keep_the_core_auth_gate(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: False)
+    with pytest.raises(_Closed) as closed:
+        _open_events('board=default')
+    assert closed.value.code == 1008
+
+
+def test_events_hand_the_socket_to_core_stream_events(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    seen = []
+
+    async def fake_stream(ws):
+        seen.append((ws.query_params.get('board'), ws.query_params.get('since')))
+        await ws.accept()
+        await ws.send_json({'events': [{'id': 9, 'task_id': 't'}], 'cursor': 9})
+        await ws.close()
+
+    async def script(socket):
+        assert await socket.receive_json() == plugin_api.HELLO_FRAME
+        assert await socket.receive_json() == {'events': [{'id': 9, 'task_id': 't'}], 'cursor': 9}
+
+    monkeypatch.setattr(core, 'stream_events', fake_stream)
+    _open_events('board=default&since=3', script)
+    assert seen == [('default', '3')]
+
+
+@pytest.mark.parametrize('board', ['missing-board', '..%2Fetc'])
+def test_events_refuse_unknown_boards_before_core(board, monkeypatch):
+    monkeypatch.setattr(plugin_api, '_core_event_stream', lambda: pytest.fail('core must not be reached'))
+    with pytest.raises(_Closed) as closed:
+        _open_events(f'board={board}')
+    assert closed.value.code == 1008
+
+
+def test_events_never_create_an_uninitialized_board_database(monkeypatch):
+    path = plugin_api.kanban_db.kanban_db_path('default')
+    assert not path.exists()
+    monkeypatch.setattr(plugin_api, '_core_event_stream', lambda: pytest.fail('core must not be reached'))
+    with pytest.raises(_Closed) as closed:
+        _open_events('board=default')
+    assert closed.value.code == 1008
+    assert not path.exists()
+
+
+def test_events_close_1011_without_a_core_stream(editable_task, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(plugin_api, '_core_dashboard', lambda: SimpleNamespace())
+    with pytest.raises(_Closed) as closed:
+        _open_events('board=default')
+    assert closed.value.code == 1011
