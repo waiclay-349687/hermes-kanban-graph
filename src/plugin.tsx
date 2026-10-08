@@ -76,7 +76,7 @@ import {
   type TaskDetail
 } from './graph'
 import { LOCALES } from './i18n'
-import { coalesce, EventCursors, eventsPath, frameEffect, graphPollMs, LIVE_COALESCE_MS, touchesTask, type FrameEffect } from './live'
+import { coalesce, EventCursors, eventsPath, frameEffect, graphPollMs, LIVE_COALESCE_MS, LIVE_LEASE_MS, touchesTask, type FrameEffect } from './live'
 import pluginCss from './plugin.css'
 import {
   BoardSwitcher,
@@ -381,6 +381,8 @@ function PageHeaderControl({ children }: { children: ReactNode }) {
 
 const eventCursors = new EventCursors()
 const liveSockets = new Set<() => void>()
+// Asks the mounted socket for (scope, board) to reopen, e.g. after a rewind.
+const socketReopen = new EventTarget()
 // Bumped on plugin dispose: frames from a socket opened before it are dropped.
 let liveGeneration = 0
 
@@ -396,7 +398,16 @@ function closeLiveSockets(): void {
 function useLiveEvents(scope: string, board: string, enabled: boolean, onFrame: (effect: FrameEffect) => void): boolean {
   const key = enabled && board ? `${scope}\u0000${board}` : ''
   const [liveKey, setLiveKey] = useState('')
+  const [reopen, setReopen] = useState(0)
   const onFrameRef = useRef(onFrame)
+  useEffect(() => {
+    if (!key) return
+    const onReopen = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === key) setReopen(n => n + 1)
+    }
+    socketReopen.addEventListener('reopen', onReopen)
+    return () => socketReopen.removeEventListener('reopen', onReopen)
+  }, [key])
   useEffect(() => {
     onFrameRef.current = onFrame
   }, [onFrame])
@@ -409,23 +420,30 @@ function useLiveEvents(scope: string, board: string, enabled: boolean, onFrame: 
     if (routed !== null && routed !== scope) return
     const generation = liveGeneration
     let current = true
+    let lease: number | undefined
     const close = dial(eventsPath(board, eventCursors.get(scope, board)), data => {
       const routedNow = routedScope()
       if (!current || generation !== liveGeneration || (routedNow !== null && routedNow !== scope)) return
-      const effect = frameEffect(data)
+      const effect = frameEffect(data, eventCursors.processed(scope, board))
       if (!effect.live) return
       eventCursors.note(scope, board, effect.cursor)
+      eventCursors.markProcessed(scope, board, effect.maxEventId)
+      // Live is a lease: a silently dropped socket stops renewing it and the
+      // graph returns to fast polling.
       setLiveKey(key)
-      onFrameRef.current(effect)
+      window.clearTimeout(lease)
+      lease = window.setTimeout(() => setLiveKey(previous => (previous === key ? '' : previous)), LIVE_LEASE_MS)
+      if (effect.refreshGraph || effect.untargeted || effect.taskIds.length) onFrameRef.current(effect)
     })
     liveSockets.add(close)
     return () => {
       current = false
+      window.clearTimeout(lease)
       if (liveSockets.delete(close)) close()
       // A reopened socket for the same board must earn "live" again.
       setLiveKey(previous => (previous === key ? '' : previous))
     }
-  }, [board, key, scope])
+  }, [board, key, scope, reopen])
   return Boolean(key) && liveKey === key
 }
 
@@ -648,7 +666,13 @@ function GraphPage() {
     queryFn: () => scopedGet<GraphPayload>(scope, `/graph?board=${encodeURIComponent(boardValue)}&include_archived=${includeArchived}`).then(graph => {
       // The snapshot's event tail (before `select` strips it): a socket opened
       // later resumes from here instead of the server's tail.
-      if (graph.board.initialized) eventCursors.note(scope, graph.board.slug, graph.board.latest_event_id)
+      if (graph.board.initialized) {
+        const tail = graph.board.latest_event_id
+        if (typeof tail === 'number' && eventCursors.rewindIfBehind(scope, graph.board.slug, tail)) {
+          socketReopen.dispatchEvent(new CustomEvent('reopen', { detail: `${scope}\u0000${graph.board.slug}` }))
+        }
+        eventCursors.note(scope, graph.board.slug, tail)
+      }
       return graph
     }),
     enabled: query => Boolean(boardValue) && routedToScope(query),

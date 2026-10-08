@@ -21,7 +21,7 @@ describe('frameEffect', () => {
         { id: 40, kind: 'status', task_id: 't_a' }
       ]
     })
-    expect(effect).toEqual({ cursor: 42, live: true, refreshGraph: true, taskIds: ['t_a', 't_b'], untargeted: false })
+    expect(effect).toEqual({ cursor: 42, live: true, maxEventId: 42, refreshGraph: true, taskIds: ['t_a', 't_b'], untargeted: false })
   })
 
   it('treats heartbeat-only frames as live but changes nothing', () => {
@@ -132,5 +132,44 @@ describe('coalesce', () => {
     job.cancel()
     clock.flush()
     expect(calls).toBe(0)
+  })
+})
+
+describe('replay, rewind and lease', () => {
+  it('skips events a reconnect replays and reports the newest new id', () => {
+    const frame = { cursor: 12, events: [{ id: 10, task_id: 't_a', kind: 'status' }, { id: 12, task_id: 't_b', kind: 'comment' }] }
+    const first = frameEffect(frame, -1)
+    expect(first.refreshGraph).toBe(true)
+    expect(first.maxEventId).toBe(12)
+    const replay = frameEffect(frame, 12)
+    expect(replay.live).toBe(true)
+    expect(replay.refreshGraph).toBe(false)
+    expect(replay.taskIds).toEqual([])
+    expect(frameEffect(frame, 10).taskIds).toEqual(['t_b'])
+  })
+
+  it('keeps the processed watermark apart from the snapshot cursor', () => {
+    const cursors = new EventCursors()
+    cursors.note('local', 'default', 50)
+    expect(cursors.processed('local', 'default')).toBe(-1)
+    cursors.markProcessed('local', 'default', 51)
+    cursors.markProcessed('local', 'default', 49)
+    expect(cursors.processed('local', 'default')).toBe(51)
+  })
+
+  it('rewinds when a snapshot tail falls behind (replaced database)', () => {
+    const cursors = new EventCursors()
+    cursors.note('local', 'default', 12)
+    cursors.markProcessed('local', 'default', 12)
+    expect(cursors.rewindIfBehind('local', 'default', 12)).toBe(false)
+    expect(cursors.rewindIfBehind('local', 'default', 1)).toBe(true)
+    expect(cursors.get('local', 'default')).toBe(1)
+    expect(cursors.processed('local', 'default')).toBe(-1)
+    expect(cursors.rewindIfBehind('remote', 'default', 0)).toBe(false)
+  })
+
+  it('treats keepalive hellos as live frames without refresh work', () => {
+    const hello = frameEffect({ events: [], hello: true, cursor: 7 })
+    expect(hello).toMatchObject({ live: true, refreshGraph: false, cursor: 7, taskIds: [], untargeted: false })
   })
 })

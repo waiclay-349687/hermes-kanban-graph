@@ -686,13 +686,17 @@ def test_events_route_is_a_websocket_on_our_router():
     assert '/events' in paths
 
 
-def test_events_stream_delegates_to_core_and_advances_the_cursor(editable_task, monkeypatch):
+def _is_hello(frame):
+    return frame.get('hello') is True and frame.get('events') == [] and isinstance(frame.get('cursor'), int)
+
+
+def test_events_stream_advances_the_cursor_with_core_auth(editable_task, monkeypatch):
     core = plugin_api._core_dashboard()
     gate_calls = []
     monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: gate_calls.append(ws) or True)
 
     async def script(socket):
-        assert await socket.receive_json() == plugin_api.HELLO_FRAME
+        assert _is_hello(await socket.receive_json())
         first = await socket.receive_events()
         assert any(event['task_id'] == editable_task for event in first['events'])
         second_task = await asyncio.to_thread(_create_task, 'Pushed live')
@@ -705,6 +709,35 @@ def test_events_stream_delegates_to_core_and_advances_the_cursor(editable_task, 
     assert len(gate_calls) == 1  # core's single-use auth gate ran exactly once
 
 
+def test_events_without_since_start_at_the_tail(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: True)
+
+    async def script(socket):
+        hello = await socket.receive_json()
+        assert _is_hello(hello) and hello['cursor'] > 0
+        new_task = await asyncio.to_thread(_create_task, 'After open')
+        frame = await socket.receive_events()
+        assert all(event['id'] > hello['cursor'] for event in frame['events'])
+        assert any(event['task_id'] == new_task for event in frame['events'])
+
+    _open_events('board=default', script)
+
+
+def test_events_keepalive_hello_while_idle(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: True)
+    monkeypatch.setattr(plugin_api, 'KEEPALIVE_SECONDS', 0.5)
+
+    async def script(socket):
+        first = await socket.receive_json()
+        second = await socket.receive_json()
+        assert _is_hello(first) and _is_hello(second)
+        assert second['cursor'] == first['cursor']
+
+    _open_events('board=default', script)
+
+
 def test_events_keep_the_core_auth_gate(editable_task, monkeypatch):
     core = plugin_api._core_dashboard()
     monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: False)
@@ -713,28 +746,9 @@ def test_events_keep_the_core_auth_gate(editable_task, monkeypatch):
     assert closed.value.code == 1008
 
 
-def test_events_hand_the_socket_to_core_stream_events(editable_task, monkeypatch):
-    core = plugin_api._core_dashboard()
-    seen = []
-
-    async def fake_stream(ws):
-        seen.append((ws.query_params.get('board'), ws.query_params.get('since')))
-        await ws.accept()
-        await ws.send_json({'events': [{'id': 9, 'task_id': 't'}], 'cursor': 9})
-        await ws.close()
-
-    async def script(socket):
-        assert await socket.receive_json() == plugin_api.HELLO_FRAME
-        assert await socket.receive_json() == {'events': [{'id': 9, 'task_id': 't'}], 'cursor': 9}
-
-    monkeypatch.setattr(core, 'stream_events', fake_stream)
-    _open_events('board=default&since=3', script)
-    assert seen == [('default', '3')]
-
-
 @pytest.mark.parametrize('board', ['missing-board', '..%2Fetc'])
-def test_events_refuse_unknown_boards_before_core(board, monkeypatch):
-    monkeypatch.setattr(plugin_api, '_core_event_stream', lambda: pytest.fail('core must not be reached'))
+def test_events_refuse_unknown_boards_before_auth(board, monkeypatch):
+    monkeypatch.setattr(plugin_api, '_core_ws_gate', lambda: pytest.fail('auth must not be reached'))
     with pytest.raises(_Closed) as closed:
         _open_events(f'board={board}')
     assert closed.value.code == 1008
@@ -743,17 +757,47 @@ def test_events_refuse_unknown_boards_before_core(board, monkeypatch):
 def test_events_never_create_an_uninitialized_board_database(monkeypatch):
     path = plugin_api.kanban_db.kanban_db_path('default')
     assert not path.exists()
-    monkeypatch.setattr(plugin_api, '_core_event_stream', lambda: pytest.fail('core must not be reached'))
+    monkeypatch.setattr(plugin_api, '_core_ws_gate', lambda: pytest.fail('auth must not be reached'))
     with pytest.raises(_Closed) as closed:
         _open_events('board=default')
     assert closed.value.code == 1008
     assert not path.exists()
 
 
-def test_events_close_1011_without_a_core_stream(editable_task, monkeypatch):
+def test_events_close_and_never_recreate_a_deleted_database(editable_task, monkeypatch):
+    core = plugin_api._core_dashboard()
+    monkeypatch.setattr(core, '_ws_upgrade_authorized', lambda ws: True)
+    path = plugin_api.kanban_db.kanban_db_path('default')
+
+    async def script(socket):
+        assert _is_hello(await socket.receive_json())
+        for suffix in ('', '-wal', '-shm'):
+            candidate = path.with_name(path.name + suffix)
+            if candidate.exists():
+                candidate.unlink()
+        with pytest.raises(_Closed) as closed:
+            while True:
+                await socket.receive_json()
+        assert closed.value.code == 1011
+
+    _open_events('board=default', script)
+    assert not path.exists()
+
+
+def test_events_close_1011_without_a_core_auth_gate(editable_task, monkeypatch):
     from types import SimpleNamespace
 
     monkeypatch.setattr(plugin_api, '_core_dashboard', lambda: SimpleNamespace())
     with pytest.raises(_Closed) as closed:
         _open_events('board=default')
     assert closed.value.code == 1011
+
+
+def test_graph_cursor_is_read_before_the_snapshot(editable_task):
+    graph = plugin_api.graph(board='default', include_archived=False)
+    conn = _connect('default')
+    try:
+        tail = conn.execute('SELECT COALESCE(MAX(id), 0) AS m FROM task_events').fetchone()[0]
+    finally:
+        conn.close()
+    assert graph['board']['latest_event_id'] <= tail

@@ -1,15 +1,17 @@
 // Live event push: pure helpers behind the `/events` socket (see plugin.tsx).
 //
-// The backend hands the socket to core Kanban's `stream_events`, so frames are
-// core's `{ events: [...], cursor: n }`, plus one `{ events: [], hello: true }`
-// our route sends right after the handshake is accepted. The hello is what
-// marks the push as live (core sends nothing on an idle board), so the graph
-// can slow its polling only once a socket really opened.
+// Frames are `{ events: [...], cursor: n }` (core Kanban's shape) plus a
+// `{ events: [], hello: true, cursor: n }` keepalive our route sends on accept
+// and every 20 s while the board is idle. The host's socket helper exposes no
+// close signal, so "live" is a lease: any frame renews it, and once it lapses
+// (LIVE_LEASE_MS without a frame) the graph goes back to fast polling.
 
 /** Graph poll while no socket frame was seen (fallback, older hosts, OAuth). */
 export const FALLBACK_GRAPH_POLL_MS = 10_000
 /** Graph poll once the socket is live: a safety net, not the refresh path. */
 export const LIVE_GRAPH_POLL_MS = 60_000
+/** A frame (event or keepalive) within this window means the push is live. */
+export const LIVE_LEASE_MS = 45_000
 /** Several frames in a burst become one refetch. */
 export const LIVE_COALESCE_MS = 250
 
@@ -34,15 +36,21 @@ export interface FrameEffect {
   taskIds: string[]
   /** Some event had no task id: refresh any open detail too. */
   untargeted: boolean
+  /** Highest new (not yet processed) stream event id in the frame. */
+  maxEventId?: number
 }
 
 const NO_EFFECT: FrameEffect = { live: false, refreshGraph: false, taskIds: [], untargeted: false }
 
-export function frameEffect(data: unknown): FrameEffect {
+/** `processedThrough`: highest stream event id already acted on. The host
+ *  reconnects with the socket's original `since`, so a reconnect replays
+ *  events; those are skipped here instead of refetching again. */
+export function frameEffect(data: unknown, processedThrough = -1): FrameEffect {
   if (!data || typeof data !== 'object') return NO_EFFECT
   const frame = data as { cursor?: unknown; events?: unknown; hello?: unknown }
-  const events = Array.isArray(frame.events) ? frame.events as LiveEvent[] : null
-  if (!events) return NO_EFFECT
+  const all = Array.isArray(frame.events) ? frame.events as LiveEvent[] : null
+  if (!all) return NO_EFFECT
+  const events = all.filter(event => !(event && typeof event === 'object' && typeof event.id === 'number' && event.id <= processedThrough))
   const cursor = typeof frame.cursor === 'number' && Number.isSafeInteger(frame.cursor) && frame.cursor >= 0
     ? frame.cursor
     : undefined
@@ -54,7 +62,12 @@ export function frameEffect(data: unknown): FrameEffect {
     if (typeof id === 'string' && id) taskIds.add(id)
     else untargeted = true
   }
-  return { cursor, live: true, refreshGraph: visible.length > 0, taskIds: [...taskIds], untargeted }
+  let maxId: number | undefined
+  for (const event of events) {
+    const id = event && typeof event === 'object' ? event.id : undefined
+    if (typeof id === 'number' && Number.isSafeInteger(id) && (maxId === undefined || id > maxId)) maxId = id
+  }
+  return { cursor, live: true, maxEventId: maxId, refreshGraph: visible.length > 0, taskIds: [...taskIds], untargeted }
 }
 
 /** Whether the open inspector's detail must refetch for this frame. */
@@ -76,6 +89,7 @@ export function eventsPath(board: string, since?: number): string {
  *  forward. */
 export class EventCursors {
   private readonly cursors = new Map<string, number>()
+  private readonly done = new Map<string, number>()
 
   private static key(scope: string, board: string): string {
     return `${scope}\u0000${board}`
@@ -92,8 +106,33 @@ export class EventCursors {
     if (seen === undefined || cursor > seen) this.cursors.set(key, cursor)
   }
 
+  /** Highest stream event id already acted on (never the snapshot's tail). */
+  processed(scope: string, board: string): number {
+    return this.done.get(EventCursors.key(scope, board)) ?? -1
+  }
+
+  markProcessed(scope: string, board: string, id: number | undefined): void {
+    if (id === undefined) return
+    const key = EventCursors.key(scope, board)
+    if (id > (this.done.get(key) ?? -1)) this.done.set(key, id)
+  }
+
+  /** A snapshot whose event tail is BELOW the remembered cursor means the
+   *  board's database was replaced (restore, recreated board): event ids
+   *  restarted. Rewind to the snapshot and forget processed ids. Returns
+   *  whether it rewound (the caller then reopens the socket). */
+  rewindIfBehind(scope: string, board: string, tail: number): boolean {
+    const key = EventCursors.key(scope, board)
+    const seen = this.cursors.get(key)
+    if (seen === undefined || tail >= seen) return false
+    this.cursors.set(key, tail)
+    this.done.delete(key)
+    return true
+  }
+
   clear(): void {
     this.cursors.clear()
+    this.done.clear()
   }
 }
 

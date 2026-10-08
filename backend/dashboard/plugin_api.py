@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import logging
 import sqlite3
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Awaitable, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from hermes_cli import kanban_db
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -277,6 +279,13 @@ def graph(
         return empty_graph(label)
     conn = _connection(path)
     try:
+        # Event tail FIRST: a write between this and the reads below makes the
+        # snapshot newer than its cursor (the socket replays one event, a
+        # harmless refetch). Reading it last could hand out a cursor past a
+        # change the snapshot does not contain, and the push would skip it.
+        latest_event_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+        ).fetchone()["m"]
         tasks = kanban_db.list_tasks(conn, include_archived=include_archived)
         summaries = kanban_db.latest_summaries(conn, [task.id for task in tasks])
         serialized_tasks = []
@@ -294,9 +303,6 @@ def graph(
         edge_rows = conn.execute(
             "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
         ).fetchall()
-        latest_event_id = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
-        ).fetchone()["m"]
         return serialize_graph(
             serialized_tasks,
             edge_rows,
@@ -404,48 +410,104 @@ def create_comment(
 # --- live events ----------------------------------------------------------------
 #
 # ``ctx.socket`` only reaches this plugin's own namespace, so the graph cannot
-# open core Kanban's ``/api/plugins/kanban/events``. This route hands the socket
-# to core's ``stream_events`` unchanged: core runs the canonical WS auth gate
-# (``?token=`` / ``?ticket=`` / ``?internal=``), the ``task_events`` tail, the
-# ``since`` cursor and the ``{"events": [...], "cursor": n}`` frames. Tickets are
-# single-use, so the gate is consulted exactly once, by core.
+# open core Kanban's ``/api/plugins/kanban/events``. This route serves the same
+# ``{"events": [...], "cursor": n}`` frames and ``since`` semantics, but tails
+# ``task_events`` through OUR strict read-only connection (``mode=ro`` +
+# ``query_only`` + deny-all-writes authorizer): it can never create, initialize
+# or migrate a board database, even if the file vanishes mid-stream (then the
+# socket closes 1011 and the frontend falls back to polling).
 #
-# Before handing over, the board is checked with the same rules as ``/graph``
-# (400 malformed / 404 unknown -> close 1008), and a board whose database does
-# not exist yet is refused (1008) because core's tail would create it. These
-# checks run before core's auth gate; a close before ``accept`` is an HTTP 403
-# handshake rejection whatever the code, so an unauthenticated caller learns
-# nothing from them. Without a usable core ``stream_events`` the socket closes
-# with 1011 and the frontend stays on polling.
+# Auth is core's canonical WS gate (``_ws_upgrade_authorized``: ``?token=`` /
+# ``?ticket=`` / ``?internal=``), consulted exactly once (tickets are
+# single-use). Without it the socket closes 1011 (fail closed). The board is
+# checked with the same rules as ``/graph`` before the gate; a close before
+# ``accept`` is an HTTP 403 handshake rejection whatever the code.
+#
+# A ``{"events": [], "hello": true, "cursor": n}`` frame is sent on accept and
+# then every ``KEEPALIVE_SECONDS``: idle boards produce no events, so the
+# keepalive is what lets the frontend tell a live socket from a silently
+# dropped one (the host's socket helper exposes no close signal).
 
 _WS_POLICY_VIOLATION = 1008
 _WS_INTERNAL_ERROR = 1011
-# Sent once after core accepts the socket: tells the frontend the push is live
-# so it can slow its polling. Core's own client ignores frames without events.
-HELLO_FRAME: dict[str, Any] = {"events": [], "hello": True}
+EVENT_POLL_SECONDS = 0.3
+KEEPALIVE_SECONDS = 20.0
+_EVENT_BATCH = 200
 
 
-def _core_event_stream() -> Optional[Callable[[WebSocket], Awaitable[None]]]:
+def hello_frame(cursor: int) -> dict[str, Any]:
+    return {"events": [], "hello": True, "cursor": cursor}
+
+
+def _core_ws_gate() -> Optional[Callable[[WebSocket], bool]]:
     try:
         core = _core_dashboard()
     except HTTPException as exc:
         log.info("kanban-graph: live events unavailable: %s", exc.detail)
         return None
-    stream = getattr(core, "stream_events", None)
-    return stream if callable(stream) else None
+    gate = getattr(core, "_ws_upgrade_authorized", None)
+    return gate if callable(gate) else None
 
 
-def _say_hello_on_accept(ws: WebSocket) -> None:
-    accept = ws.accept
+def _since_param(raw: Optional[str]) -> Optional[int]:
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return None
 
-    async def accept_then_hello(*args: Any, **kwargs: Any) -> None:
-        await accept(*args, **kwargs)
+
+class _ReadOnlyEventTail:
+    """One read-only connection per socket, used and closed on a single worker
+    thread (sqlite connections are thread-affine)."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kanban-graph-events")
+
+    def _db(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = _connection(self._path)  # raises if the file is gone
+        return self._conn
+
+    def _latest(self) -> int:
+        row = self._db().execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()
+        return int(row["m"]) if row else 0
+
+    def _fetch(self, cursor: int) -> tuple[int, list[dict[str, Any]]]:
+        if not self._path.exists():
+            raise FileNotFoundError(str(self._path))
+        rows = self._db().execute(
+            "SELECT id, task_id, run_id, kind, created_at FROM task_events "
+            "WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (cursor, _EVENT_BATCH),
+        ).fetchall()
+        events = [dict(row) for row in rows]
+        return (int(rows[-1]["id"]) if rows else cursor), events
+
+    def _close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    async def run(self, fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+
+    async def latest(self) -> int:
+        return await self.run(self._latest)
+
+    async def poll(self, cursor: int) -> tuple[int, list[dict[str, Any]]]:
+        return await self.run(self._fetch, cursor)
+
+    async def shutdown(self) -> None:
         try:
-            await ws.send_json(HELLO_FRAME)
-        except Exception:  # client already gone: core's receive loop notices
-            pass
-
-    ws.accept = accept_then_hello  # type: ignore[method-assign]
+            await self.run(self._close)
+        except Exception as exc:  # pragma: no cover - best effort
+            log.warning("kanban-graph: event stream cleanup failed: %s", exc)
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 @router.websocket("/events")
@@ -456,12 +518,50 @@ async def stream_events(ws: WebSocket):
     except HTTPException:
         await ws.close(code=_WS_POLICY_VIOLATION)
         return
-    stream = _core_event_stream()
-    if stream is None:
+    gate = _core_ws_gate()
+    if gate is None:
         await ws.close(code=_WS_INTERNAL_ERROR)
         return
-    _say_hello_on_accept(ws)
-    await stream(ws)
+    if not gate(ws):
+        await ws.close(code=_WS_POLICY_VIOLATION)
+        return
+    path = kanban_db.kanban_db_path(slug)
+    tail = _ReadOnlyEventTail(path)
+    try:
+        since = _since_param(ws.query_params.get("since"))
+        cursor = since if since is not None else await tail.latest()
+        await ws.accept()
+        await ws.send_json(hello_frame(cursor))
+        loop = asyncio.get_running_loop()
+        last_sent = loop.time()
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=EVENT_POLL_SECONDS)
+                if message["type"] == "websocket.disconnect":
+                    return
+            except asyncio.TimeoutError:
+                pass
+            cursor, events = await tail.poll(cursor)
+            if events:
+                await ws.send_json({"events": events, "cursor": cursor})
+                last_sent = loop.time()
+            elif loop.time() - last_sent >= KEEPALIVE_SECONDS:
+                await ws.send_json(hello_frame(cursor))
+                last_sent = loop.time()
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return
+    except (HTTPException, FileNotFoundError, sqlite3.Error) as exc:
+        log.info("kanban-graph: event stream for %r stopped: %s", slug, exc)
+        try:
+            await ws.close(code=_WS_INTERNAL_ERROR)
+        except Exception:
+            pass
+    except Exception as exc:  # never crash the dashboard worker
+        log.warning("kanban-graph: event stream error: %s", exc)
+    finally:
+        await tail.shutdown()
 
 
 @router.post("/dispatch")
