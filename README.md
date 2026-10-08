@@ -2,6 +2,19 @@
 
 A standalone Hermes Desktop plugin that renders the existing Kanban task graph and dependency DAG with React Flow and Dagre. It does not patch Hermes core or create a second task store: Hermes Kanban remains authoritative.
 
+## How this differs from Senci/hermes-kanban-graph
+
+[Senci/hermes-kanban-graph](https://github.com/Senci/hermes-kanban-graph) is an independent community plugin with the same name, built around the same time. It is a **read-only, all-boards** observatory with a live event stream, worker run history, deep links and a static HTML snapshot. Use it if that is what you need.
+
+This plugin focuses on **working on one board inside the graph**:
+
+- Edit status (only the moves core Kanban allows), title and description, and add comments, all delegated to core Kanban handlers.
+- Follow the board selected on the Kanban page, or pin any other board.
+- Drag cards and keep their positions per board, with filters for status, assignee, tenant, archived and linked-only.
+- Chinese and English UI.
+
+The two plugins are unrelated codebases. If you install both, the different plugin ids keep them apart, but the sidebar labels will look alike.
+
 ## Features
 
 - Full-page native Desktop route at `/kanban-graph`
